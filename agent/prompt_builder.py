@@ -71,15 +71,17 @@ DEFAULT_AGENT_IDENTITY = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Proactively save important things "
-    "you learn (user preferences, environment details, useful approaches) and do "
-    "(like a diary!) using the memory tool -- don't wait to be asked."
+    "You have persistent memory across sessions. Save durable facts using the memory "
+    "tool: user preferences, environment details, tool quirks, and stable conventions. "
+    "Memory is injected into every turn, so keep it compact. Do NOT save task progress, "
+    "session outcomes, or completed-work logs to memory; use session_search to recall "
+    "those from past transcripts."
 )
 
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
-    "relevant prior context exists, use session_search to recall it before asking "
-    "them to repeat themselves."
+    "relevant cross-session context exists, use session_search to recall it before "
+    "asking them to repeat themselves."
 )
 
 SKILLS_GUIDANCE = (
@@ -122,6 +124,30 @@ PLATFORM_HINTS = {
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be uploaded as attachments."
     ),
+    "signal": (
+        "You are on a text messaging communication platform, Signal. "
+        "Please do not use markdown as it does not render. "
+        "You can send media files natively: to deliver a file to the user, "
+        "include MEDIA:/absolute/path/to/file in your response. Images "
+        "(.png, .jpg, .webp) appear as photos, audio as attachments, and other "
+        "files arrive as downloadable documents. You can also include image "
+        "URLs in markdown format ![alt](url) and they will be sent as photos."
+    ),
+    "email": (
+        "You are communicating via email. Write clear, well-structured responses "
+        "suitable for email. Use plain text formatting (no markdown). "
+        "Keep responses concise but complete. You can send file attachments — "
+        "include MEDIA:/absolute/path/to/file in your response. The subject line "
+        "is preserved for threading. Do not include greetings or sign-offs unless "
+        "contextually appropriate."
+    ),
+    "cron": (
+        "You are running as a scheduled cron job. Your final response is automatically "
+        "delivered to the job's configured destination, so do not use send_message to "
+        "send to that same target again. If you want the user to receive something in "
+        "the scheduled destination, put it directly in your final response. Use "
+        "send_message only for additional or different targets."
+    ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
         "renderable inside a terminal."
@@ -137,40 +163,87 @@ CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 # Skills index
 # =========================================================================
 
-def _read_skill_description(skill_file: Path, max_chars: int = 60) -> str:
-    """Read the description from a SKILL.md frontmatter, capped at max_chars."""
-    try:
-        raw = skill_file.read_text(encoding="utf-8")[:2000]
-        match = re.search(
-            r"^---\s*\n.*?description:\s*(.+?)\s*\n.*?^---",
-            raw, re.MULTILINE | re.DOTALL,
-        )
-        if match:
-            desc = match.group(1).strip().strip("'\"")
-            if len(desc) > max_chars:
-                desc = desc[:max_chars - 3] + "..."
-            return desc
-    except Exception:
-        pass
-    return ""
+def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
+    """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
-
-def _skill_is_platform_compatible(skill_file: Path) -> bool:
-    """Quick check if a SKILL.md is compatible with the current OS platform.
-
-    Reads just enough to parse the ``platforms`` frontmatter field.
-    Skills without the field (the vast majority) are always compatible.
+    Returns (is_compatible, frontmatter, description). On any error, returns
+    (True, {}, "") to err on the side of showing the skill.
     """
     try:
         from tools.skills_tool import _parse_frontmatter, skill_matches_platform
+
         raw = skill_file.read_text(encoding="utf-8")[:2000]
         frontmatter, _ = _parse_frontmatter(raw)
-        return skill_matches_platform(frontmatter)
-    except Exception:
-        return True  # Err on the side of showing the skill
+
+        if not skill_matches_platform(frontmatter):
+            return False, {}, ""
+
+        desc = ""
+        raw_desc = frontmatter.get("description", "")
+        if raw_desc:
+            desc = str(raw_desc).strip().strip("'\"")
+            if len(desc) > 60:
+                desc = desc[:57] + "..."
+
+        return True, frontmatter, desc
+    except Exception as e:
+        logger.debug("Failed to parse skill file %s: %s", skill_file, e)
+        return True, {}, ""
 
 
-def build_skills_system_prompt() -> str:
+def _read_skill_conditions(skill_file: Path) -> dict:
+    """Extract conditional activation fields from SKILL.md frontmatter."""
+    try:
+        from tools.skills_tool import _parse_frontmatter
+        raw = skill_file.read_text(encoding="utf-8")[:2000]
+        frontmatter, _ = _parse_frontmatter(raw)
+        hermes = frontmatter.get("metadata", {}).get("hermes", {})
+        return {
+            "fallback_for_toolsets": hermes.get("fallback_for_toolsets", []),
+            "requires_toolsets": hermes.get("requires_toolsets", []),
+            "fallback_for_tools": hermes.get("fallback_for_tools", []),
+            "requires_tools": hermes.get("requires_tools", []),
+        }
+    except Exception as e:
+        logger.debug("Failed to read skill conditions from %s: %s", skill_file, e)
+        return {}
+
+
+def _skill_should_show(
+    conditions: dict,
+    available_tools: "set[str] | None",
+    available_toolsets: "set[str] | None",
+) -> bool:
+    """Return False if the skill's conditional activation rules exclude it."""
+    if available_tools is None and available_toolsets is None:
+        return True  # No filtering info — show everything (backward compat)
+
+    at = available_tools or set()
+    ats = available_toolsets or set()
+
+    # fallback_for: hide when the primary tool/toolset IS available
+    for ts in conditions.get("fallback_for_toolsets", []):
+        if ts in ats:
+            return False
+    for t in conditions.get("fallback_for_tools", []):
+        if t in at:
+            return False
+
+    # requires: hide when a required tool/toolset is NOT available
+    for ts in conditions.get("requires_toolsets", []):
+        if ts not in ats:
+            return False
+    for t in conditions.get("requires_tools", []):
+        if t not in at:
+            return False
+
+    return True
+
+
+def build_skills_system_prompt(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+) -> str:
     """Build a compact skill index for the system prompt.
 
     Scans ~/.hermes/skills/ for SKILL.md files grouped by category.
@@ -184,31 +257,43 @@ def build_skills_system_prompt() -> str:
     if not skills_dir.exists():
         return ""
 
-    # Collect skills with descriptions, grouped by category
+    # Collect skills with descriptions, grouped by category.
     # Each entry: (skill_name, description)
+    # Supports sub-categories: skills/mlops/training/axolotl/SKILL.md
+    # -> category "mlops/training", skill "axolotl"
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     for skill_file in skills_dir.rglob("SKILL.md"):
-        # Skip skills incompatible with the current OS platform
-        if not _skill_is_platform_compatible(skill_file):
+        is_compatible, _, desc = _parse_skill_file(skill_file)
+        if not is_compatible:
+            continue
+        # Skip skills whose conditional activation rules exclude them
+        conditions = _read_skill_conditions(skill_file)
+        if not _skill_should_show(conditions, available_tools, available_toolsets):
             continue
         rel_path = skill_file.relative_to(skills_dir)
         parts = rel_path.parts
         if len(parts) >= 2:
-            category = parts[0]
+            # Category is everything between skills_dir and the skill folder
+            # e.g. parts = ("mlops", "training", "axolotl", "SKILL.md")
+            #   → category = "mlops/training", skill_name = "axolotl"
+            # e.g. parts = ("github", "github-auth", "SKILL.md")
+            #   → category = "github", skill_name = "github-auth"
             skill_name = parts[-2]
+            category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
         else:
             category = "general"
             skill_name = skill_file.parent.name
-        desc = _read_skill_description(skill_file)
         skills_by_category.setdefault(category, []).append((skill_name, desc))
 
     if not skills_by_category:
         return ""
 
     # Read category-level descriptions from DESCRIPTION.md
+    # Checks both the exact category path and parent directories
     category_descriptions = {}
     for category in skills_by_category:
-        desc_file = skills_dir / category / "DESCRIPTION.md"
+        cat_path = Path(category)
+        desc_file = skills_dir / cat_path / "DESCRIPTION.md"
         if desc_file.exists():
             try:
                 content = desc_file.read_text(encoding="utf-8")
@@ -270,7 +355,7 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
     """Discover and load context files for the system prompt.
 
     Discovery: AGENTS.md (recursive), .cursorrules / .cursor/rules/*.mdc,
-    SOUL.md (cwd then ~/.hermes/ fallback). Each capped at 20,000 chars.
+    and SOUL.md from HERMES_HOME only. Each capped at 20,000 chars.
     """
     if cwd is None:
         cwd = os.getcwd()
@@ -338,29 +423,21 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
         cursorrules_content = _truncate_content(cursorrules_content, ".cursorrules")
         sections.append(cursorrules_content)
 
-    # SOUL.md (cwd first, then ~/.hermes/ fallback)
-    soul_path = None
-    for name in ["SOUL.md", "soul.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
-            soul_path = candidate
-            break
-    if not soul_path:
-        global_soul = Path.home() / ".hermes" / "SOUL.md"
-        if global_soul.exists():
-            soul_path = global_soul
+    # SOUL.md from HERMES_HOME only
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    if soul_path:
+    soul_path = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "SOUL.md"
+    if soul_path.exists():
         try:
             content = soul_path.read_text(encoding="utf-8").strip()
             if content:
                 content = _scan_context_content(content, "SOUL.md")
                 content = _truncate_content(content, "SOUL.md")
-                sections.append(
-                    f"## SOUL.md\n\nIf SOUL.md is present, embody its persona and tone. "
-                    f"Avoid stiff, generic replies; follow its guidance unless higher-priority "
-                    f"instructions override it.\n\n{content}"
-                )
+                sections.append(content)
         except Exception as e:
             logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
 

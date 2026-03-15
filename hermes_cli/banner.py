@@ -6,7 +6,9 @@ Pure display functions with no HermesCLI state dependency.
 import json
 import logging
 import os
+import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -37,10 +39,32 @@ def cprint(text: str):
 
 
 # =========================================================================
+# Skin-aware color helpers
+# =========================================================================
+
+def _skin_color(key: str, fallback: str) -> str:
+    """Get a color from the active skin, or return fallback."""
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        return get_active_skin().get_color(key, fallback)
+    except Exception:
+        return fallback
+
+
+def _skin_branding(key: str, fallback: str) -> str:
+    """Get a branding string from the active skin, or return fallback."""
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        return get_active_skin().get_branding(key, fallback)
+    except Exception:
+        return fallback
+
+
+# =========================================================================
 # ASCII Art & Branding
 # =========================================================================
 
-from hermes_cli import __version__ as VERSION
+from hermes_cli import __version__ as VERSION, __release_date__ as RELEASE_DATE
 
 HERMES_AGENT_LOGO = """[bold #FFD700]██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗[/]
 [bold #FFD700]██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝[/]
@@ -121,7 +145,9 @@ def check_for_updates() -> Optional[int]:
     repo_dir = hermes_home / "hermes-agent"
     cache_file = hermes_home / ".update_check"
 
-    # Must be a git repo
+    # Must be a git repo — fall back to project root for dev installs
+    if not (repo_dir / ".git").exists():
+        repo_dir = Path(__file__).parent.parent.resolve()
     if not (repo_dir / ".git").exists():
         return None
 
@@ -166,6 +192,30 @@ def check_for_updates() -> Optional[int]:
         pass
 
     return behind
+
+
+# =========================================================================
+# Non-blocking update check
+# =========================================================================
+
+_update_result: Optional[int] = None
+_update_check_done = threading.Event()
+
+
+def prefetch_update_check():
+    """Kick off update check in a background daemon thread."""
+    def _run():
+        global _update_result
+        _update_result = check_for_updates()
+        _update_check_done.set()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def get_update_result(timeout: float = 0.5) -> Optional[int]:
+    """Get result of prefetched check. Returns None if not ready."""
+    _update_check_done.wait(timeout=timeout)
+    return _update_result
 
 
 # =========================================================================
@@ -217,18 +267,32 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     layout_table.add_column("left", justify="center")
     layout_table.add_column("right", justify="left")
 
-    left_lines = ["", HERMES_CADUCEUS, ""]
+    # Resolve skin colors once for the entire banner
+    accent = _skin_color("banner_accent", "#FFBF00")
+    dim = _skin_color("banner_dim", "#B8860B")
+    text = _skin_color("banner_text", "#FFF8DC")
+    session_color = _skin_color("session_border", "#8B8682")
+
+    # Use skin's custom caduceus art if provided
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        _bskin = get_active_skin()
+        _hero = _bskin.banner_hero if hasattr(_bskin, 'banner_hero') and _bskin.banner_hero else HERMES_CADUCEUS
+    except Exception:
+        _bskin = None
+        _hero = HERMES_CADUCEUS
+    left_lines = ["", _hero, ""]
     model_short = model.split("/")[-1] if "/" in model else model
     if len(model_short) > 28:
         model_short = model_short[:25] + "..."
-    ctx_str = f" [dim #B8860B]·[/] [dim #B8860B]{_format_context_length(context_length)} context[/]" if context_length else ""
-    left_lines.append(f"[#FFBF00]{model_short}[/]{ctx_str} [dim #B8860B]·[/] [dim #B8860B]Nous Research[/]")
-    left_lines.append(f"[dim #B8860B]{cwd}[/]")
+    ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
+    left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
+    left_lines.append(f"[dim {dim}]{cwd}[/]")
     if session_id:
-        left_lines.append(f"[dim #8B8682]Session: {session_id}[/]")
+        left_lines.append(f"[dim {session_color}]Session: {session_id}[/]")
     left_content = "\n".join(left_lines)
 
-    right_lines = ["[bold #FFBF00]Available Tools[/]"]
+    right_lines = [f"[bold {accent}]Available Tools[/]"]
     toolsets_dict: Dict[str, list] = {}
 
     for tool in tools:
@@ -256,7 +320,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
             if name in disabled_tools:
                 colored_names.append(f"[red]{name}[/]")
             else:
-                colored_names.append(f"[#FFF8DC]{name}[/]")
+                colored_names.append(f"[{text}]{name}[/]")
 
         tools_str = ", ".join(colored_names)
         if len(", ".join(sorted(tool_names))) > 45:
@@ -275,7 +339,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
                 elif name in disabled_tools:
                     colored_names.append(f"[red]{name}[/]")
                 else:
-                    colored_names.append(f"[#FFF8DC]{name}[/]")
+                    colored_names.append(f"[{text}]{name}[/]")
             tools_str = ", ".join(colored_names)
 
         right_lines.append(f"[dim #B8860B]{toolset}:[/] {tools_str}")
@@ -306,7 +370,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
                 )
 
     right_lines.append("")
-    right_lines.append("[bold #FFBF00]Available Skills[/]")
+    right_lines.append(f"[bold {accent}]Available Skills[/]")
     skills_by_category = get_available_skills()
     total_skills = sum(len(s) for s in skills_by_category.values())
 
@@ -320,9 +384,9 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
                 skills_str = ", ".join(skill_names)
             if len(skills_str) > 50:
                 skills_str = skills_str[:47] + "..."
-            right_lines.append(f"[dim #B8860B]{category}:[/] [#FFF8DC]{skills_str}[/]")
+            right_lines.append(f"[dim {dim}]{category}:[/] [{text}]{skills_str}[/]")
     else:
-        right_lines.append("[dim #B8860B]No skills installed[/]")
+        right_lines.append(f"[dim {dim}]No skills installed[/]")
 
     right_lines.append("")
     mcp_connected = sum(1 for s in mcp_status if s["connected"]) if mcp_status else 0
@@ -330,11 +394,11 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     if mcp_connected:
         summary_parts.append(f"{mcp_connected} MCP servers")
     summary_parts.append("/help for commands")
-    right_lines.append(f"[dim #B8860B]{' · '.join(summary_parts)}[/]")
+    right_lines.append(f"[dim {dim}]{' · '.join(summary_parts)}[/]")
 
-    # Update check — show if behind origin/main
+    # Update check — use prefetched result if available
     try:
-        behind = check_for_updates()
+        behind = get_update_result(timeout=0.5)
         if behind and behind > 0:
             commits_word = "commit" if behind == 1 else "commits"
             right_lines.append(
@@ -347,14 +411,20 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     right_content = "\n".join(right_lines)
     layout_table.add_row(left_content, right_content)
 
+    agent_name = _skin_branding("agent_name", "Hermes Agent")
+    title_color = _skin_color("banner_title", "#FFD700")
+    border_color = _skin_color("banner_border", "#CD7F32")
     outer_panel = Panel(
         layout_table,
-        title=f"[bold #FFD700]Hermes Agent {VERSION}[/]",
-        border_style="#CD7F32",
+        title=f"[bold {title_color}]{agent_name} v{VERSION} ({RELEASE_DATE})[/]",
+        border_style=border_color,
         padding=(0, 2),
     )
 
     console.print()
-    console.print(HERMES_AGENT_LOGO)
-    console.print()
+    term_width = shutil.get_terminal_size().columns
+    if term_width >= 95:
+        _logo = _bskin.banner_logo if _bskin and hasattr(_bskin, 'banner_logo') and _bskin.banner_logo else HERMES_AGENT_LOGO
+        console.print(_logo)
+        console.print()
     console.print(outer_panel)

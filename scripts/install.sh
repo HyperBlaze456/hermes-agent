@@ -492,9 +492,23 @@ install_system_packages() {
                         return 0
                     fi
                 fi
+            elif [ -e /dev/tty ]; then
+                # Non-interactive (e.g. curl | bash) but a terminal is available.
+                # Read the prompt from /dev/tty (same approach the setup wizard uses).
+                echo ""
+                log_info "Installing ${description} requires sudo."
+                read -p "Install? [Y/n] " -n 1 -r < /dev/tty
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+                    if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd < /dev/tty; then
+                        [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
+                        [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
+                        return 0
+                    fi
+                fi
             else
-                log_warn "Non-interactive mode: cannot prompt for sudo password"
-                log_info "Install missing packages manually: sudo $install_cmd"
+                log_warn "Non-interactive mode and no terminal available — cannot install system packages"
+                log_info "Install manually after setup completes: sudo $install_cmd"
             fi
         fi
     fi
@@ -548,9 +562,51 @@ clone_repo() {
         if [ -d "$INSTALL_DIR/.git" ]; then
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
+
+            local autostash_ref=""
+            if [ -n "$(git status --porcelain)" ]; then
+                local stash_name
+                stash_name="hermes-install-autostash-$(date -u +%Y%m%d-%H%M%S)"
+                log_info "Local changes detected, stashing before update..."
+                git stash push --include-untracked -m "$stash_name"
+                autostash_ref="$(git rev-parse --verify refs/stash)"
+            fi
+
             git fetch origin
             git checkout "$BRANCH"
             git pull origin "$BRANCH"
+
+            if [ -n "$autostash_ref" ]; then
+                local restore_now="yes"
+                if [ -t 0 ] && [ -t 1 ]; then
+                    echo
+                    log_warn "Local changes were stashed before updating."
+                    log_warn "Restoring them may reapply local customizations onto the updated codebase."
+                    printf "Restore local changes now? [Y/n] "
+                    read -r restore_answer
+                    case "$restore_answer" in
+                        ""|y|Y|yes|YES|Yes) restore_now="yes" ;;
+                        *) restore_now="no" ;;
+                    esac
+                fi
+
+                if [ "$restore_now" = "yes" ]; then
+                    log_info "Restoring local changes..."
+                    if git stash apply "$autostash_ref"; then
+                        git stash drop "$autostash_ref" >/dev/null
+                        log_warn "Local changes were restored on top of the updated codebase."
+                        log_warn "Review git diff / git status if Hermes behaves unexpectedly."
+                    else
+                        log_error "Update succeeded, but restoring local changes failed. Your changes are still preserved in git stash."
+                        log_info "Resolve manually with: git stash apply $autostash_ref"
+                        exit 1
+                    fi
+                else
+                    log_info "Skipped restoring local changes."
+                    log_info "Your changes are still preserved in git stash."
+                    log_info "Restore manually with: git stash apply $autostash_ref"
+                fi
+            fi
         else
             log_error "Directory exists but is not a git repository: $INSTALL_DIR"
             log_info "Remove it or choose a different directory with --dir"
@@ -558,17 +614,16 @@ clone_repo() {
         fi
     else
         # Try SSH first (for private repo access), fall back to HTTPS
-        # Use --recurse-submodules to also clone mini-swe-agent and tinker-atropos
         # GIT_SSH_COMMAND disables interactive prompts and sets a short timeout
         # so SSH fails fast instead of hanging when no key is configured.
         log_info "Trying SSH clone..."
         if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
-           git clone --branch "$BRANCH" --recurse-submodules "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
+           git clone --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
             log_success "Cloned via SSH"
         else
             rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
             log_info "SSH failed, trying HTTPS..."
-            if git clone --branch "$BRANCH" --recurse-submodules "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+            if git clone --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
                 log_success "Cloned via HTTPS"
             else
                 log_error "Failed to clone repository"
@@ -579,10 +634,12 @@ clone_repo() {
 
     cd "$INSTALL_DIR"
 
-    # Ensure submodules are initialized and updated (for existing installs or if --recurse failed)
-    log_info "Initializing submodules (mini-swe-agent, tinker-atropos)..."
-    git submodule update --init --recursive
-    log_success "Submodules ready"
+    # Only init mini-swe-agent (terminal tool backend — required).
+    # tinker-atropos (RL training) is optional and heavy — users can opt in later
+    # with: git submodule update --init tinker-atropos && uv pip install -e ./tinker-atropos
+    log_info "Initializing mini-swe-agent submodule (terminal backend)..."
+    git submodule update --init mini-swe-agent
+    log_success "Submodule ready"
 
     log_success "Repository ready"
 }
@@ -665,12 +722,11 @@ install_deps() {
         log_warn "mini-swe-agent not found (run: git submodule update --init)"
     fi
 
-    log_info "Installing tinker-atropos (RL training backend)..."
+    # tinker-atropos (RL training) is optional — skip by default.
+    # To enable RL tools: git submodule update --init tinker-atropos && uv pip install -e "./tinker-atropos"
     if [ -d "tinker-atropos" ] && [ -f "tinker-atropos/pyproject.toml" ]; then
-        $UV_CMD pip install -e "./tinker-atropos" || log_warn "tinker-atropos install failed (RL tools may not work)"
-        log_success "tinker-atropos installed"
-    else
-        log_warn "tinker-atropos not found (run: git submodule update --init)"
+        log_info "tinker-atropos submodule found — skipping install (optional, for RL training)"
+        log_info "  To install: $UV_CMD pip install -e \"./tinker-atropos\""
     fi
 
     log_success "All dependencies installed"

@@ -182,7 +182,7 @@ class TestBuildSessionContextPrompt:
             platforms={
                 Platform.DISCORD: PlatformConfig(
                     enabled=True,
-                    token="fake-discord-token",
+                    token="fake-d...oken",
                 ),
             },
         )
@@ -197,6 +197,27 @@ class TestBuildSessionContextPrompt:
         prompt = build_session_context_prompt(ctx)
 
         assert "Discord" in prompt
+        assert "cannot search" in prompt.lower() or "do not have access" in prompt.lower()
+
+    def test_slack_prompt_includes_platform_notes(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_name="general",
+            chat_type="group",
+            user_name="bob",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Slack" in prompt
+        assert "cannot search" in prompt.lower()
+        assert "pin" in prompt.lower()
 
     def test_discord_prompt_with_channel_topic(self):
         """Channel topic should appear in the session context prompt."""
@@ -317,7 +338,7 @@ class TestSessionStoreRewriteTranscript:
 
 class TestWhatsAppDMSessionKeyConsistency:
     """Regression: all session-key construction must go through build_session_key
-    so WhatsApp DMs include chat_id while other DMs do not."""
+    so DMs are isolated by chat_id across platforms."""
 
     @pytest.fixture()
     def store(self, tmp_path):
@@ -348,15 +369,24 @@ class TestWhatsAppDMSessionKeyConsistency:
         )
         assert store._generate_session_key(source) == build_session_key(source)
 
-    def test_telegram_dm_omits_chat_id(self):
-        """Non-WhatsApp DMs should still omit chat_id (single owner DM)."""
+    def test_telegram_dm_includes_chat_id(self):
+        """Non-WhatsApp DMs should also include chat_id to separate users."""
         source = SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="99",
             chat_type="dm",
         )
         key = build_session_key(source)
-        assert key == "agent:main:telegram:dm"
+        assert key == "agent:main:telegram:dm:99"
+
+    def test_distinct_dm_chat_ids_get_distinct_session_keys(self):
+        """Different DM chats must not collapse into one shared session."""
+        first = SessionSource(platform=Platform.TELEGRAM, chat_id="99", chat_type="dm")
+        second = SessionSource(platform=Platform.TELEGRAM, chat_id="100", chat_type="dm")
+
+        assert build_session_key(first) == "agent:main:telegram:dm:99"
+        assert build_session_key(second) == "agent:main:telegram:dm:100"
+        assert build_session_key(first) != build_session_key(second)
 
     def test_discord_group_includes_chat_id(self):
         """Group/channel keys include chat_type and chat_id."""
@@ -367,6 +397,17 @@ class TestWhatsAppDMSessionKeyConsistency:
         )
         key = build_session_key(source)
         assert key == "agent:main:discord:group:guild-123"
+
+    def test_group_thread_includes_thread_id(self):
+        """Forum-style threads need a distinct session key within one group."""
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1002285219667",
+            chat_type="group",
+            thread_id="17585",
+        )
+        key = build_session_key(source)
+        assert key == "agent:main:telegram:group:-1002285219667:17585"
 
 
 class TestSessionStoreEntriesAttribute:
@@ -429,3 +470,144 @@ class TestHasAnySessions:
 
         store._entries = {"key1": MagicMock()}
         assert store.has_any_sessions() is False
+
+
+class TestLastPromptTokens:
+    """Tests for the last_prompt_tokens field — actual API token tracking."""
+
+    def test_session_entry_default(self):
+        """New sessions should have last_prompt_tokens=0."""
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        assert entry.last_prompt_tokens == 0
+
+    def test_session_entry_roundtrip(self):
+        """last_prompt_tokens should survive serialization/deserialization."""
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            last_prompt_tokens=42000,
+        )
+        d = entry.to_dict()
+        assert d["last_prompt_tokens"] == 42000
+        restored = SessionEntry.from_dict(d)
+        assert restored.last_prompt_tokens == 42000
+
+    def test_session_entry_from_old_data(self):
+        """Old session data without last_prompt_tokens should default to 0."""
+        from gateway.session import SessionEntry
+        data = {
+            "session_key": "test",
+            "session_id": "s1",
+            "created_at": "2025-01-01T00:00:00",
+            "updated_at": "2025-01-01T00:00:00",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            # No last_prompt_tokens — old format
+        }
+        entry = SessionEntry.from_dict(data)
+        assert entry.last_prompt_tokens == 0
+
+    def test_update_session_sets_last_prompt_tokens(self, tmp_path):
+        """update_session should store the actual prompt token count."""
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        store._entries = {"k1": entry}
+
+        store.update_session("k1", last_prompt_tokens=85000)
+        assert entry.last_prompt_tokens == 85000
+
+    def test_update_session_none_does_not_change(self, tmp_path):
+        """update_session with default (None) should not change last_prompt_tokens."""
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            last_prompt_tokens=50000,
+        )
+        store._entries = {"k1": entry}
+
+        store.update_session("k1")  # No last_prompt_tokens arg
+        assert entry.last_prompt_tokens == 50000  # unchanged
+
+    def test_update_session_zero_resets(self, tmp_path):
+        """update_session with last_prompt_tokens=0 should reset the field."""
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            last_prompt_tokens=85000,
+        )
+        store._entries = {"k1": entry}
+
+        store.update_session("k1", last_prompt_tokens=0)
+        assert entry.last_prompt_tokens == 0
+
+    def test_update_session_passes_model_to_db(self, tmp_path):
+        """Gateway session updates should forward the resolved model to SQLite."""
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._save = MagicMock()
+        store._db = MagicMock()
+
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        store._entries = {"k1": entry}
+
+        store.update_session("k1", model="openai/gpt-5.4")
+
+        store._db.update_token_counts.assert_called_once_with(
+            "s1", 0, 0, model="openai/gpt-5.4"
+        )

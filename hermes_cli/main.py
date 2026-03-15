@@ -18,13 +18,34 @@ Usage:
     hermes cron list           # List cron jobs
     hermes cron status         # Check if cron scheduler is running
     hermes doctor              # Check configuration and dependencies
-    hermes version             # Show version
-    hermes update              # Update to latest version
-    hermes uninstall           # Uninstall Hermes Agent
+    hermes honcho setup                    # Configure Honcho AI memory integration
+    hermes honcho status                   # Show Honcho config and connection status
+    hermes honcho sessions                 # List directory → session name mappings
+    hermes honcho map <name>               # Map current directory to a session name
+    hermes honcho peer                     # Show peer names and dialectic settings
+    hermes honcho peer --user NAME         # Set user peer name
+    hermes honcho peer --ai NAME           # Set AI peer name
+    hermes honcho peer --reasoning LEVEL   # Set dialectic reasoning level
+    hermes honcho mode                     # Show current memory mode
+    hermes honcho mode [hybrid|honcho|local]  # Set memory mode
+    hermes honcho tokens                   # Show token budget settings
+    hermes honcho tokens --context N       # Set session.context() token cap
+    hermes honcho tokens --dialectic N     # Set dialectic result char cap
+    hermes honcho identity                 # Show AI peer identity representation
+    hermes honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
+    hermes honcho migrate                  # Step-by-step migration guide: OpenClaw native → Hermes + Honcho
+    hermes version             Show version
+    hermes update              Update to latest version
+    hermes uninstall           Uninstall Hermes Agent
+    hermes acp                 Run as an ACP server for editor integration
+    hermes sessions browse     Interactive session picker with search
+
+    hermes claw migrate --dry-run  # Preview migration without changes
 """
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -33,27 +54,42 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback
-from dotenv import load_dotenv
-from hermes_cli.config import get_env_path, get_hermes_home
-_user_env = get_env_path()
-if _user_env.exists():
-    try:
-        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
-load_dotenv(dotenv_path=PROJECT_ROOT / '.env', override=False)
+# Load .env from ~/.hermes/.env first, then project root as dev fallback.
+# User-managed env files should override stale shell exports on restart.
+from hermes_cli.config import get_hermes_home
+from hermes_cli.env_loader import load_hermes_dotenv
+load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
 # Point mini-swe-agent at ~/.hermes/ so it shares our config
 os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(get_hermes_home()))
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
 import logging
+import time as _time
+from datetime import datetime
 
-from hermes_cli import __version__
+from hermes_cli import __version__, __release_date__
 from hermes_constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
+
+
+def _relative_time(ts) -> str:
+    """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
+    if not ts:
+        return "?"
+    delta = _time.time() - ts
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta / 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta / 3600)}h ago"
+    if delta < 172800:
+        return "yesterday"
+    if delta < 604800:
+        return f"{int(delta / 86400)}d ago"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 
 def _has_any_provider_configured() -> bool:
@@ -67,7 +103,7 @@ def _has_any_provider_configured() -> bool:
     from hermes_cli.auth import PROVIDER_REGISTRY
 
     # Collect all provider env vars
-    provider_env_vars = {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL"}
+    provider_env_vars = {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"}
     for pconfig in PROVIDER_REGISTRY.values():
         if pconfig.auth_type == "api_key":
             provider_env_vars.update(pconfig.api_key_env_vars)
@@ -106,6 +142,240 @@ def _has_any_provider_configured() -> bool:
     return False
 
 
+def _session_browse_picker(sessions: list) -> Optional[str]:
+    """Interactive curses-based session browser with live search filtering.
+
+    Returns the selected session ID, or None if cancelled.
+    Uses curses (not simple_term_menu) to avoid the ghost-duplication rendering
+    bug in tmux/iTerm when arrow keys are used.
+    """
+    if not sessions:
+        print("No sessions found.")
+        return None
+
+    # Try curses-based picker first
+    try:
+        import curses
+
+        result_holder = [None]
+
+        def _format_row(s, max_x):
+            """Format a session row for display."""
+            title = (s.get("title") or "").strip()
+            preview = (s.get("preview") or "").strip()
+            source = s.get("source", "")[:6]
+            last_active = _relative_time(s.get("last_active"))
+            sid = s["id"][:18]
+
+            # Adaptive column widths based on terminal width
+            # Layout: [arrow 3] [title/preview flexible] [active 12] [src 6] [id 18]
+            fixed_cols = 3 + 12 + 6 + 18 + 6  # arrow + active + src + id + padding
+            name_width = max(20, max_x - fixed_cols)
+
+            if title:
+                name = title[:name_width]
+            elif preview:
+                name = preview[:name_width]
+            else:
+                name = sid
+
+            return f"{name:<{name_width}}  {last_active:<10}  {source:<5} {sid}"
+
+        def _match(s, query):
+            """Check if a session matches the search query (case-insensitive)."""
+            q = query.lower()
+            return (
+                q in (s.get("title") or "").lower()
+                or q in (s.get("preview") or "").lower()
+                or q in s.get("id", "").lower()
+                or q in (s.get("source") or "").lower()
+            )
+
+        def _curses_browse(stdscr):
+            curses.curs_set(0)
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_GREEN, -1)   # selected
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)  # header
+                curses.init_pair(3, curses.COLOR_CYAN, -1)    # search
+                curses.init_pair(4, 8, -1)                    # dim
+
+            cursor = 0
+            scroll_offset = 0
+            search_text = ""
+            filtered = list(sessions)
+
+            while True:
+                stdscr.clear()
+                max_y, max_x = stdscr.getmaxyx()
+                if max_y < 5 or max_x < 40:
+                    # Terminal too small
+                    try:
+                        stdscr.addstr(0, 0, "Terminal too small")
+                    except curses.error:
+                        pass
+                    stdscr.refresh()
+                    stdscr.getch()
+                    return
+
+                # Header line
+                if search_text:
+                    header = f"  Browse sessions — filter: {search_text}█"
+                    header_attr = curses.A_BOLD
+                    if curses.has_colors():
+                        header_attr |= curses.color_pair(3)
+                else:
+                    header = "  Browse sessions — ↑↓ navigate  Enter select  Type to filter  Esc quit"
+                    header_attr = curses.A_BOLD
+                    if curses.has_colors():
+                        header_attr |= curses.color_pair(2)
+                try:
+                    stdscr.addnstr(0, 0, header, max_x - 1, header_attr)
+                except curses.error:
+                    pass
+
+                # Column header line
+                fixed_cols = 3 + 12 + 6 + 18 + 6
+                name_width = max(20, max_x - fixed_cols)
+                col_header = f"   {'Title / Preview':<{name_width}}  {'Active':<10}  {'Src':<5} {'ID'}"
+                try:
+                    dim_attr = curses.color_pair(4) if curses.has_colors() else curses.A_DIM
+                    stdscr.addnstr(1, 0, col_header, max_x - 1, dim_attr)
+                except curses.error:
+                    pass
+
+                # Compute visible area
+                visible_rows = max_y - 4  # header + col header + blank + footer
+                if visible_rows < 1:
+                    visible_rows = 1
+
+                # Clamp cursor and scroll
+                if not filtered:
+                    try:
+                        msg = "  No sessions match the filter."
+                        stdscr.addnstr(3, 0, msg, max_x - 1, curses.A_DIM)
+                    except curses.error:
+                        pass
+                else:
+                    if cursor >= len(filtered):
+                        cursor = len(filtered) - 1
+                    if cursor < 0:
+                        cursor = 0
+                    if cursor < scroll_offset:
+                        scroll_offset = cursor
+                    elif cursor >= scroll_offset + visible_rows:
+                        scroll_offset = cursor - visible_rows + 1
+
+                    for draw_i, i in enumerate(range(
+                        scroll_offset,
+                        min(len(filtered), scroll_offset + visible_rows)
+                    )):
+                        y = draw_i + 3
+                        if y >= max_y - 1:
+                            break
+                        s = filtered[i]
+                        arrow = " → " if i == cursor else "   "
+                        row = arrow + _format_row(s, max_x - 3)
+                        attr = curses.A_NORMAL
+                        if i == cursor:
+                            attr = curses.A_BOLD
+                            if curses.has_colors():
+                                attr |= curses.color_pair(1)
+                        try:
+                            stdscr.addnstr(y, 0, row, max_x - 1, attr)
+                        except curses.error:
+                            pass
+
+                # Footer
+                footer_y = max_y - 1
+                if filtered:
+                    footer = f"  {cursor + 1}/{len(filtered)} sessions"
+                    if len(filtered) < len(sessions):
+                        footer += f" (filtered from {len(sessions)})"
+                else:
+                    footer = f"  0/{len(sessions)} sessions"
+                try:
+                    stdscr.addnstr(footer_y, 0, footer, max_x - 1,
+                                   curses.color_pair(4) if curses.has_colors() else curses.A_DIM)
+                except curses.error:
+                    pass
+
+                stdscr.refresh()
+                key = stdscr.getch()
+
+                if key in (curses.KEY_UP, ):
+                    if filtered:
+                        cursor = (cursor - 1) % len(filtered)
+                elif key in (curses.KEY_DOWN, ):
+                    if filtered:
+                        cursor = (cursor + 1) % len(filtered)
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    if filtered:
+                        result_holder[0] = filtered[cursor]["id"]
+                    return
+                elif key == 27:  # Esc
+                    if search_text:
+                        # First Esc clears the search
+                        search_text = ""
+                        filtered = list(sessions)
+                        cursor = 0
+                        scroll_offset = 0
+                    else:
+                        # Second Esc exits
+                        return
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    if search_text:
+                        search_text = search_text[:-1]
+                        if search_text:
+                            filtered = [s for s in sessions if _match(s, search_text)]
+                        else:
+                            filtered = list(sessions)
+                        cursor = 0
+                        scroll_offset = 0
+                elif key == ord('q') and not search_text:
+                    return
+                elif 32 <= key <= 126:
+                    # Printable character → add to search filter
+                    search_text += chr(key)
+                    filtered = [s for s in sessions if _match(s, search_text)]
+                    cursor = 0
+                    scroll_offset = 0
+
+        curses.wrapper(_curses_browse)
+        return result_holder[0]
+
+    except Exception:
+        pass
+
+    # Fallback: numbered list (Windows without curses, etc.)
+    print("\n  Browse sessions  (enter number to resume, q to cancel)\n")
+    for i, s in enumerate(sessions):
+        title = (s.get("title") or "").strip()
+        preview = (s.get("preview") or "").strip()
+        label = title or preview or s["id"]
+        if len(label) > 50:
+            label = label[:47] + "..."
+        last_active = _relative_time(s.get("last_active"))
+        src = s.get("source", "")[:6]
+        print(f"  {i + 1:>3}. {label:<50}  {last_active:<10}  {src}")
+
+    while True:
+        try:
+            val = input(f"\n  Select [1-{len(sessions)}]: ").strip()
+            if not val or val.lower() in ("q", "quit", "exit"):
+                return None
+            idx = int(val) - 1
+            if 0 <= idx < len(sessions):
+                return sessions[idx]["id"]
+            print(f"  Invalid selection. Enter 1-{len(sessions)} or q to cancel.")
+        except ValueError:
+            print(f"  Invalid input. Enter a number or q to cancel.")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+
+
 def _resolve_last_cli_session() -> Optional[str]:
     """Look up the most recent CLI session ID from SQLite. Returns None if unavailable."""
     try:
@@ -120,16 +390,63 @@ def _resolve_last_cli_session() -> Optional[str]:
     return None
 
 
+def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
+    """Resolve a session name (title) or ID to a session ID.
+
+    - If it looks like a session ID (contains underscore + hex), try direct lookup first.
+    - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
+    - Falls back to the other method if the first doesn't match.
+    """
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+
+        # Try as exact session ID first
+        session = db.get_session(name_or_id)
+        if session:
+            db.close()
+            return session["id"]
+
+        # Try as title (with auto-latest for lineage)
+        session_id = db.resolve_session_by_title(name_or_id)
+        db.close()
+        return session_id
+    except Exception:
+        pass
+    return None
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
-    # Resolve --continue into --resume with the latest CLI session
-    if getattr(args, "continue_last", False) and not getattr(args, "resume", None):
-        last_id = _resolve_last_cli_session()
-        if last_id:
-            args.resume = last_id
+    # Resolve --continue into --resume with the latest CLI session or by name
+    continue_val = getattr(args, "continue_last", None)
+    if continue_val and not getattr(args, "resume", None):
+        if isinstance(continue_val, str):
+            # -c "session name" — resolve by title or ID
+            resolved = _resolve_session_by_name_or_id(continue_val)
+            if resolved:
+                args.resume = resolved
+            else:
+                print(f"No session found matching '{continue_val}'.")
+                print("Use 'hermes sessions list' to see available sessions.")
+                sys.exit(1)
         else:
-            print("No previous CLI session found to continue.")
-            sys.exit(1)
+            # -c with no argument — continue the most recent session
+            last_id = _resolve_last_cli_session()
+            if last_id:
+                args.resume = last_id
+            else:
+                print("No previous CLI session found to continue.")
+                sys.exit(1)
+
+    # Resolve --resume by title if it's not a direct session ID
+    resume_val = getattr(args, "resume", None)
+    if resume_val:
+        resolved = _resolve_session_by_name_or_id(resume_val)
+        if resolved:
+            args.resume = resolved
+        # If resolution fails, keep the original value — _init_agent will
+        # report "Session not found" with the original input
 
     # First-run guard: check if any provider is configured before launching
     if not _has_any_provider_configured():
@@ -138,6 +455,15 @@ def cmd_chat(args):
         print()
         print("  Run:  hermes setup")
         print()
+
+        from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance
+
+        if not is_interactive_stdin():
+            print_noninteractive_setup_guidance(
+                "No interactive TTY detected for the first-run setup prompt."
+            )
+            sys.exit(1)
+
         try:
             reply = input("Run setup now? [Y/n] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -149,12 +475,23 @@ def cmd_chat(args):
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
 
+    # Start update check in background (runs while other init happens)
+    try:
+        from hermes_cli.banner import prefetch_update_check
+        prefetch_update_check()
+    except Exception:
+        pass
+
     # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
     try:
         from tools.skills_sync import sync_skills
         sync_skills(quiet=True)
     except Exception:
         pass
+
+    # --yolo: bypass all dangerous command approvals
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
 
     # Import and run the CLI
     from cli import main as cli_main
@@ -164,15 +501,23 @@ def cmd_chat(args):
         "model": args.model,
         "provider": getattr(args, "provider", None),
         "toolsets": args.toolsets,
+        "skills": getattr(args, "skills", None),
         "verbose": args.verbose,
+        "quiet": getattr(args, "quiet", False),
         "query": args.query,
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
+        "checkpoints": getattr(args, "checkpoints", False),
+        "pass_session_id": getattr(args, "pass_session_id", False),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     
-    cli_main(**kwargs)
+    try:
+        cli_main(**kwargs)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
 
 def cmd_gateway(args):
@@ -302,7 +647,7 @@ def cmd_whatsapp(args):
         print("✓ Bridge dependencies already installed")
 
     # ── Step 5: Check for existing session ───────────────────────────────
-    session_dir = Path.home() / ".hermes" / "whatsapp" / "session"
+    session_dir = get_hermes_home() / "whatsapp" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if (session_dir / "creds.json").exists():
@@ -399,8 +744,8 @@ def cmd_model(args):
         config_provider = model_cfg.get("provider")
 
     effective_provider = (
-        os.getenv("HERMES_INFERENCE_PROVIDER")
-        or config_provider
+        config_provider
+        or os.getenv("HERMES_INFERENCE_PROVIDER")
         or "auto"
     )
     try:
@@ -418,6 +763,7 @@ def cmd_model(args):
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
+        "anthropic": "Anthropic",
         "zai": "Z.AI / GLM",
         "kimi-coding": "Kimi / Moonshot",
         "minimax": "MiniMax",
@@ -436,12 +782,43 @@ def cmd_model(args):
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
+        ("anthropic", "Anthropic (Claude models — API key or Claude Code)"),
         ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
         ("minimax", "MiniMax (global direct API)"),
         ("minimax-cn", "MiniMax China (domestic direct API)"),
-        ("custom", "Custom endpoint (self-hosted / VLLM / etc.)"),
     ]
+
+    # Add user-defined custom providers from config.yaml
+    custom_providers_cfg = config.get("custom_providers") or []
+    _custom_provider_map = {}  # key → {name, base_url, api_key}
+    if isinstance(custom_providers_cfg, list):
+        for entry in custom_providers_cfg:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name", "").strip()
+            base_url = entry.get("base_url", "").strip()
+            if not name or not base_url:
+                continue
+            # Generate a stable key from the name
+            key = "custom:" + name.lower().replace(" ", "-")
+            short_url = base_url.replace("https://", "").replace("http://", "").rstrip("/")
+            saved_model = entry.get("model", "")
+            model_hint = f" — {saved_model}" if saved_model else ""
+            providers.append((key, f"{name} ({short_url}){model_hint}"))
+            _custom_provider_map[key] = {
+                "name": name,
+                "base_url": base_url,
+                "api_key": entry.get("api_key", ""),
+                "model": saved_model,
+            }
+
+    # Always add the manual custom endpoint option last
+    providers.append(("custom", "Custom endpoint (enter URL manually)"))
+
+    # Add removal option if there are saved custom providers
+    if _custom_provider_map:
+        providers.append(("remove-custom", "Remove a saved custom provider"))
 
     # Reorder so the active provider is at the top
     known_keys = {k for k, _ in providers}
@@ -470,7 +847,15 @@ def cmd_model(args):
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "custom":
         _model_flow_custom(config)
-    elif selected_provider in ("zai", "kimi-coding", "minimax", "minimax-cn"):
+    elif selected_provider.startswith("custom:") and selected_provider in _custom_provider_map:
+        _model_flow_named_custom(config, _custom_provider_map[selected_provider])
+    elif selected_provider == "remove-custom":
+        _remove_custom_provider(config)
+    elif selected_provider == "anthropic":
+        _model_flow_anthropic(config, current_model)
+    elif selected_provider == "kimi-coding":
+        _model_flow_kimi(config, current_model)
+    elif selected_provider in ("zai", "minimax", "minimax-cn"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
@@ -550,9 +935,11 @@ def _model_flow_openrouter(config, current_model=""):
         from hermes_cli.config import load_config, save_config
         cfg = load_config()
         model = cfg.get("model")
-        if isinstance(model, dict):
-            model["provider"] = "openrouter"
-            model["base_url"] = OPENROUTER_BASE_URL
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = "openrouter"
+        model["base_url"] = OPENROUTER_BASE_URL
         save_config(cfg)
         deactivate_provider()
         print(f"Default model set to: {selected} (via OpenRouter)")
@@ -669,6 +1056,7 @@ def _model_flow_openai_codex(config, current_model=""):
         _codex_token = _codex_creds.get("api_key")
     except Exception:
         pass
+
     codex_models = get_codex_model_ids(access_token=_codex_token)
 
     selected = _prompt_model_selection(codex_models, current_model=current_model)
@@ -684,8 +1072,13 @@ def _model_flow_openai_codex(config, current_model=""):
         print("No change.")
 
 
+
 def _model_flow_custom(config):
-    """Custom endpoint: collect URL, API key, and model name."""
+    """Custom endpoint: collect URL, API key, and model name.
+
+    Automatically saves the endpoint to ``custom_providers`` in config.yaml
+    so it appears in the provider menu on subsequent runs.
+    """
     from hermes_cli.auth import _save_model_choice, deactivate_provider
     from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
 
@@ -717,6 +1110,8 @@ def _model_flow_custom(config):
         print(f"Invalid URL: {effective_url} (must start with http:// or https://)")
         return
 
+    effective_key = api_key or current_key
+
     if base_url:
         save_env_value("OPENAI_BASE_URL", base_url)
     if api_key:
@@ -728,9 +1123,11 @@ def _model_flow_custom(config):
         # Update config and deactivate any OAuth provider
         cfg = load_config()
         model = cfg.get("model")
-        if isinstance(model, dict):
-            model["provider"] = "auto"
-            model["base_url"] = effective_url
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = "custom"
+        model["base_url"] = effective_url
         save_config(cfg)
         deactivate_provider()
 
@@ -739,6 +1136,227 @@ def _model_flow_custom(config):
         if base_url or api_key:
             deactivate_provider()
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
+
+    # Auto-save to custom_providers so it appears in the menu next time
+    _save_custom_provider(effective_url, effective_key, model_name or "")
+
+
+def _save_custom_provider(base_url, api_key="", model=""):
+    """Save a custom endpoint to custom_providers in config.yaml.
+
+    Deduplicates by base_url — if the URL already exists, updates the
+    model name but doesn't add a duplicate entry.
+    Auto-generates a display name from the URL hostname.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    providers = cfg.get("custom_providers") or []
+    if not isinstance(providers, list):
+        providers = []
+
+    # Check if this URL is already saved — update model if so
+    for entry in providers:
+        if isinstance(entry, dict) and entry.get("base_url", "").rstrip("/") == base_url.rstrip("/"):
+            if model and entry.get("model") != model:
+                entry["model"] = model
+                cfg["custom_providers"] = providers
+                save_config(cfg)
+            return  # already saved, updated model if needed
+
+    # Auto-generate a name from the URL
+    import re
+    clean = base_url.replace("https://", "").replace("http://", "").rstrip("/")
+    # Remove /v1 suffix for cleaner names
+    clean = re.sub(r"/v1/?$", "", clean)
+    # Use hostname:port as the name
+    name = clean.split("/")[0]
+    # Capitalize for readability
+    if "localhost" in name or "127.0.0.1" in name:
+        name = f"Local ({name})"
+    elif "runpod" in name.lower():
+        name = f"RunPod ({name})"
+    else:
+        name = name.capitalize()
+
+    entry = {"name": name, "base_url": base_url}
+    if api_key:
+        entry["api_key"] = api_key
+    if model:
+        entry["model"] = model
+
+    providers.append(entry)
+    cfg["custom_providers"] = providers
+    save_config(cfg)
+    print(f"  💾 Saved to custom providers as \"{name}\" (edit in config.yaml)")
+
+
+def _remove_custom_provider(config):
+    """Let the user remove a saved custom provider from config.yaml."""
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    providers = cfg.get("custom_providers") or []
+    if not isinstance(providers, list) or not providers:
+        print("No custom providers configured.")
+        return
+
+    print("Remove a custom provider:\n")
+
+    choices = []
+    for entry in providers:
+        if isinstance(entry, dict):
+            name = entry.get("name", "unnamed")
+            url = entry.get("base_url", "")
+            short_url = url.replace("https://", "").replace("http://", "").rstrip("/")
+            choices.append(f"{name} ({short_url})")
+        else:
+            choices.append(str(entry))
+    choices.append("Cancel")
+
+    try:
+        from simple_term_menu import TerminalMenu
+        menu = TerminalMenu(
+            [f"  {c}" for c in choices], cursor_index=0,
+            menu_cursor="-> ", menu_cursor_style=("fg_red", "bold"),
+            menu_highlight_style=("fg_red",),
+            cycle_cursor=True, clear_screen=False,
+            title="Select provider to remove:",
+        )
+        idx = menu.show()
+        print()
+    except (ImportError, NotImplementedError):
+        for i, c in enumerate(choices, 1):
+            print(f"  {i}. {c}")
+        print()
+        try:
+            val = input(f"Choice [1-{len(choices)}]: ").strip()
+            idx = int(val) - 1 if val else None
+        except (ValueError, KeyboardInterrupt, EOFError):
+            idx = None
+
+    if idx is None or idx >= len(providers):
+        print("No change.")
+        return
+
+    removed = providers.pop(idx)
+    cfg["custom_providers"] = providers
+    save_config(cfg)
+    removed_name = removed.get("name", "unnamed") if isinstance(removed, dict) else str(removed)
+    print(f"✅ Removed \"{removed_name}\" from custom providers.")
+
+
+def _model_flow_named_custom(config, provider_info):
+    """Handle a named custom provider from config.yaml custom_providers list.
+
+    If the entry has a saved model name, activates it immediately.
+    Otherwise probes the endpoint's /models API to let the user pick one.
+    """
+    from hermes_cli.auth import _save_model_choice, deactivate_provider
+    from hermes_cli.config import save_env_value, load_config, save_config
+    from hermes_cli.models import fetch_api_models
+
+    name = provider_info["name"]
+    base_url = provider_info["base_url"]
+    api_key = provider_info.get("api_key", "")
+    saved_model = provider_info.get("model", "")
+
+    # If a model is saved, just activate immediately — no probing needed
+    if saved_model:
+        save_env_value("OPENAI_BASE_URL", base_url)
+        if api_key:
+            save_env_value("OPENAI_API_KEY", api_key)
+        _save_model_choice(saved_model)
+
+        cfg = load_config()
+        model = cfg.get("model")
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = "custom"
+        model["base_url"] = base_url
+        save_config(cfg)
+        deactivate_provider()
+
+        print(f"✅ Switched to: {saved_model}")
+        print(f"   Provider: {name} ({base_url})")
+        return
+
+    # No saved model — probe endpoint and let user pick
+    print(f"  Provider: {name}")
+    print(f"  URL:      {base_url}")
+    print()
+    print("No model saved for this provider. Fetching available models...")
+    models = fetch_api_models(api_key, base_url, timeout=8.0)
+
+    if models:
+        print(f"Found {len(models)} model(s):\n")
+        try:
+            from simple_term_menu import TerminalMenu
+            menu_items = [f"  {m}" for m in models] + ["  Cancel"]
+            menu = TerminalMenu(
+                menu_items, cursor_index=0,
+                menu_cursor="-> ", menu_cursor_style=("fg_green", "bold"),
+                menu_highlight_style=("fg_green",),
+                cycle_cursor=True, clear_screen=False,
+                title=f"Select model from {name}:",
+            )
+            idx = menu.show()
+            print()
+            if idx is None or idx >= len(models):
+                print("Cancelled.")
+                return
+            model_name = models[idx]
+        except (ImportError, NotImplementedError):
+            for i, m in enumerate(models, 1):
+                print(f"  {i}. {m}")
+            print(f"  {len(models) + 1}. Cancel")
+            print()
+            try:
+                val = input(f"Choice [1-{len(models) + 1}]: ").strip()
+                if not val:
+                    print("Cancelled.")
+                    return
+                idx = int(val) - 1
+                if idx < 0 or idx >= len(models):
+                    print("Cancelled.")
+                    return
+                model_name = models[idx]
+            except (ValueError, KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                return
+    else:
+        print("Could not fetch models from endpoint. Enter model name manually.")
+        try:
+            model_name = input("Model name: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return
+        if not model_name:
+            print("No model specified. Cancelled.")
+            return
+
+    # Activate and save the model to the custom_providers entry
+    save_env_value("OPENAI_BASE_URL", base_url)
+    if api_key:
+        save_env_value("OPENAI_API_KEY", api_key)
+    _save_model_choice(model_name)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = "custom"
+    model["base_url"] = base_url
+    save_config(cfg)
+    deactivate_provider()
+
+    # Save model name to the custom_providers entry for next time
+    _save_custom_provider(base_url, api_key, model_name)
+
+    print(f"\n✅ Model set to: {model_name}")
+    print(f"   Provider: {name} ({base_url})")
 
 
 # Curated model lists for direct API-key providers
@@ -750,6 +1368,14 @@ _PROVIDER_MODELS = {
         "glm-4.5-flash",
     ],
     "kimi-coding": [
+        "kimi-for-coding",
+        "kimi-k2.5",
+        "kimi-k2-thinking",
+        "kimi-k2-thinking-turbo",
+        "kimi-k2-turbo-preview",
+        "kimi-k2-0905-preview",
+    ],
+    "moonshot": [
         "kimi-k2.5",
         "kimi-k2-thinking",
         "kimi-k2-turbo-preview",
@@ -768,8 +1394,112 @@ _PROVIDER_MODELS = {
 }
 
 
+def _model_flow_kimi(config, current_model=""):
+    """Kimi / Moonshot model selection with automatic endpoint routing.
+
+    - sk-kimi-* keys   → api.kimi.com/coding/v1  (Kimi Coding Plan)
+    - Other keys        → api.moonshot.ai/v1      (legacy Moonshot)
+
+    No manual base URL prompt — endpoint is determined by key prefix.
+    """
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY, KIMI_CODE_BASE_URL, _prompt_model_selection,
+        _save_model_choice, deactivate_provider,
+    )
+    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
+
+    provider_id = "kimi-coding"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
+    base_url_env = pconfig.base_url_env_var or ""
+
+    # Step 1: Check / prompt for API key
+    existing_key = ""
+    for ev in pconfig.api_key_env_vars:
+        existing_key = get_env_value(ev) or os.getenv(ev, "")
+        if existing_key:
+            break
+
+    if not existing_key:
+        print(f"No {pconfig.name} API key configured.")
+        if key_env:
+            try:
+                new_key = input(f"{key_env} (or Enter to cancel): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return
+            if not new_key:
+                print("Cancelled.")
+                return
+            save_env_value(key_env, new_key)
+            existing_key = new_key
+            print("API key saved.")
+            print()
+    else:
+        print(f"  {pconfig.name} API key: {existing_key[:8]}... ✓")
+        print()
+
+    # Step 2: Auto-detect endpoint from key prefix
+    is_coding_plan = existing_key.startswith("sk-kimi-")
+    if is_coding_plan:
+        effective_base = KIMI_CODE_BASE_URL
+        print(f"  Detected Kimi Coding Plan key → {effective_base}")
+    else:
+        effective_base = pconfig.inference_base_url
+        print(f"  Using Moonshot endpoint → {effective_base}")
+    # Clear any manual base URL override so auto-detection works at runtime
+    if base_url_env and get_env_value(base_url_env):
+        save_env_value(base_url_env, "")
+    print()
+
+    # Step 3: Model selection — show appropriate models for the endpoint
+    if is_coding_plan:
+        # Coding Plan models (kimi-for-coding first)
+        model_list = [
+            "kimi-for-coding",
+            "kimi-k2.5",
+            "kimi-k2-thinking",
+            "kimi-k2-thinking-turbo",
+        ]
+    else:
+        # Legacy Moonshot models (excludes Coding Plan-only models)
+        model_list = _PROVIDER_MODELS.get("moonshot", [])
+
+    if model_list:
+        selected = _prompt_model_selection(model_list, current_model=current_model)
+    else:
+        try:
+            selected = input("Enter model name: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if selected:
+        # Clear custom endpoint if set (avoid confusion)
+        if get_env_value("OPENAI_BASE_URL"):
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+
+        _save_model_choice(selected)
+
+        # Update config with provider and base URL
+        cfg = load_config()
+        model = cfg.get("model")
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = provider_id
+        model["base_url"] = effective_base
+        save_config(cfg)
+        deactivate_provider()
+
+        endpoint_label = "Kimi Coding" if is_coding_plan else "Moonshot"
+        print(f"Default model set to: {selected} (via {endpoint_label})")
+    else:
+        print("No change.")
+
+
 def _model_flow_api_key_provider(config, provider_id, current_model=""):
-    """Generic flow for API-key providers (z.ai, Kimi, MiniMax)."""
+    """Generic flow for API-key providers (z.ai, MiniMax)."""
     from hermes_cli.auth import (
         PROVIDER_REGISTRY, _prompt_model_selection, _save_model_choice,
         _update_config_for_provider, deactivate_provider,
@@ -820,8 +1550,21 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         save_env_value(base_url_env, override)
         effective_base = override
 
-    # Model selection
-    model_list = _PROVIDER_MODELS.get(provider_id, [])
+    # Model selection — try live /models endpoint first, fall back to defaults
+    from hermes_cli.models import fetch_api_models
+    api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
+    live_models = fetch_api_models(api_key_for_probe, effective_base)
+
+    if live_models:
+        model_list = live_models
+        print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
+    else:
+        model_list = _PROVIDER_MODELS.get(provider_id, [])
+        if model_list:
+            print(f"  ⚠ Could not auto-detect models from API — showing defaults.")
+            print(f"    Use \"Enter custom model name\" if you don't see your model.")
+        # else: no defaults either, will fall through to raw input
+
     if model_list:
         selected = _prompt_model_selection(model_list, current_model=current_model)
     else:
@@ -841,13 +1584,232 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         # Update config with provider and base URL
         cfg = load_config()
         model = cfg.get("model")
-        if isinstance(model, dict):
-            model["provider"] = provider_id
-            model["base_url"] = effective_base
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = provider_id
+        model["base_url"] = effective_base
         save_config(cfg)
         deactivate_provider()
 
         print(f"Default model set to: {selected} (via {pconfig.name})")
+    else:
+        print("No change.")
+
+
+def _run_anthropic_oauth_flow(save_env_value):
+    """Run the Claude OAuth setup-token flow. Returns True if credentials were saved."""
+    from agent.anthropic_adapter import (
+        run_oauth_setup_token,
+        read_claude_code_credentials,
+        is_claude_code_token_valid,
+    )
+    from hermes_cli.config import (
+        save_anthropic_oauth_token,
+        use_anthropic_claude_code_credentials,
+    )
+
+    def _activate_claude_code_credentials_if_available() -> bool:
+        try:
+            creds = read_claude_code_credentials()
+        except Exception:
+            creds = None
+        if creds and (
+            is_claude_code_token_valid(creds)
+            or bool(creds.get("refreshToken"))
+        ):
+            use_anthropic_claude_code_credentials(save_fn=save_env_value)
+            print("  ✓ Claude Code credentials linked.")
+            print("    Hermes will use Claude's credential store directly instead of copying a setup-token into ~/.hermes/.env.")
+            return True
+        return False
+
+    try:
+        print()
+        print("  Running 'claude setup-token' — follow the prompts below.")
+        print("  A browser window will open for you to authorize access.")
+        print()
+        token = run_oauth_setup_token()
+        if token:
+            if _activate_claude_code_credentials_if_available():
+                return True
+            save_anthropic_oauth_token(token, save_fn=save_env_value)
+            print("  ✓ OAuth credentials saved.")
+            return True
+
+        # Subprocess completed but no token auto-detected — ask user to paste
+        print()
+        print("  If the setup-token was displayed above, paste it here:")
+        print()
+        try:
+            manual_token = input("  Paste setup-token (or Enter to cancel): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+        if manual_token:
+            save_anthropic_oauth_token(manual_token, save_fn=save_env_value)
+            print("  ✓ Setup-token saved.")
+            return True
+
+        print("  ⚠ Could not detect saved credentials.")
+        return False
+
+    except FileNotFoundError:
+        # Claude CLI not installed — guide user through manual setup
+        print()
+        print("  The 'claude' CLI is required for OAuth login.")
+        print()
+        print("  To install and authenticate:")
+        print()
+        print("    1. Install Claude Code:  npm install -g @anthropic-ai/claude-code")
+        print("    2. Run:                  claude setup-token")
+        print("    3. Follow the browser prompts to authorize")
+        print("    4. Re-run:               hermes model")
+        print()
+        print("  Or paste an existing setup-token now (sk-ant-oat-...):")
+        print()
+        try:
+            token = input("  Setup-token (or Enter to cancel): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+        if token:
+            save_anthropic_oauth_token(token, save_fn=save_env_value)
+            print("  ✓ Setup-token saved.")
+            return True
+        print("  Cancelled — install Claude Code and try again.")
+        return False
+
+
+def _model_flow_anthropic(config, current_model=""):
+    """Flow for Anthropic provider — OAuth subscription, API key, or Claude Code creds."""
+    import os
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY, _prompt_model_selection, _save_model_choice,
+        _update_config_for_provider, deactivate_provider,
+    )
+    from hermes_cli.config import (
+        get_env_value, save_env_value, load_config, save_config,
+        save_anthropic_api_key,
+    )
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    pconfig = PROVIDER_REGISTRY["anthropic"]
+
+    # Check ALL credential sources
+    existing_key = (
+        get_env_value("ANTHROPIC_TOKEN")
+        or os.getenv("ANTHROPIC_TOKEN", "")
+        or get_env_value("ANTHROPIC_API_KEY")
+        or os.getenv("ANTHROPIC_API_KEY", "")
+        or os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+    )
+    cc_available = False
+    try:
+        from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
+        cc_creds = read_claude_code_credentials()
+        if cc_creds and is_claude_code_token_valid(cc_creds):
+            cc_available = True
+    except Exception:
+        pass
+
+    has_creds = bool(existing_key) or cc_available
+    needs_auth = not has_creds
+
+    if has_creds:
+        # Show what we found
+        if existing_key:
+            print(f"  Anthropic credentials: {existing_key[:12]}... ✓")
+        elif cc_available:
+            print("  Claude Code credentials: ✓ (auto-detected)")
+        print()
+        print("    1. Use existing credentials")
+        print("    2. Reauthenticate (new OAuth login)")
+        print("    3. Cancel")
+        print()
+        try:
+            choice = input("  Choice [1/2/3]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            choice = "1"
+
+        if choice == "2":
+            needs_auth = True
+        elif choice == "3":
+            return
+        # choice == "1" or default: use existing, proceed to model selection
+
+    if needs_auth:
+        # Show auth method choice
+        print()
+        print("  Choose authentication method:")
+        print()
+        print("    1. Claude Pro/Max subscription (OAuth login)")
+        print("    2. Anthropic API key (pay-per-token)")
+        print("    3. Cancel")
+        print()
+        try:
+            choice = input("  Choice [1/2/3]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+        if choice == "1":
+            if not _run_anthropic_oauth_flow(save_env_value):
+                return
+
+        elif choice == "2":
+            print()
+            print("  Get an API key at: https://console.anthropic.com/settings/keys")
+            print()
+            try:
+                api_key = input("  API key (sk-ant-...): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return
+            if not api_key:
+                print("  Cancelled.")
+                return
+            save_anthropic_api_key(api_key, save_fn=save_env_value)
+            print("  ✓ API key saved.")
+
+        else:
+            print("  No change.")
+            return
+    print()
+
+    # Model selection
+    model_list = _PROVIDER_MODELS.get("anthropic", [])
+    if model_list:
+        selected = _prompt_model_selection(model_list, current_model=current_model)
+    else:
+        try:
+            selected = input("Model name (e.g., claude-sonnet-4-20250514): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if selected:
+        # Clear custom endpoint if set
+        if get_env_value("OPENAI_BASE_URL"):
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+
+        _save_model_choice(selected)
+
+        # Update config with provider — clear base_url since
+        # resolve_runtime_provider() always hardcodes Anthropic's URL.
+        # Leaving a stale base_url in config can contaminate other
+        # providers if the user switches without running 'hermes model'.
+        cfg = load_config()
+        model = cfg.get("model")
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = "anthropic"
+        model.pop("base_url", None)
+        save_config(cfg)
+        deactivate_provider()
+
+        print(f"Default model set to: {selected} (via Anthropic)")
     else:
         print("No change.")
 
@@ -890,7 +1852,7 @@ def cmd_config(args):
 
 def cmd_version(args):
     """Show version."""
-    print(f"Hermes Agent v{__version__}")
+    print(f"Hermes Agent v{__version__} ({__release_date__})")
     print(f"Project: {PROJECT_ROOT}")
     
     # Show Python version
@@ -902,6 +1864,18 @@ def cmd_version(args):
         print(f"OpenAI SDK: {openai.__version__}")
     except ImportError:
         print("OpenAI SDK: Not installed")
+
+    # Show update status (synchronous — acceptable since user asked for version info)
+    try:
+        from hermes_cli.banner import check_for_updates
+        behind = check_for_updates()
+        if behind and behind > 0:
+            commits_word = "commit" if behind == 1 else "commits"
+            print(f"Update available: {behind} {commits_word} behind — run 'hermes update'")
+        elif behind == 0:
+            print("Up to date")
+    except Exception:
+        pass
 
 
 def cmd_uninstall(args):
@@ -1006,9 +1980,128 @@ def _update_via_zip(args):
     print("✓ Update complete!")
 
 
+def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if not status.stdout.strip():
+        return None
+
+    from datetime import datetime, timezone
+
+    stash_name = datetime.now(timezone.utc).strftime("hermes-update-autostash-%Y%m%d-%H%M%S")
+    print("→ Local changes detected — stashing before update...")
+    subprocess.run(
+        git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
+        cwd=cwd,
+        check=True,
+    )
+    stash_ref = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", "refs/stash"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return stash_ref
+
+
+
+def _resolve_stash_selector(git_cmd: list[str], cwd: Path, stash_ref: str) -> Optional[str]:
+    stash_list = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%gd %H"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for line in stash_list.stdout.splitlines():
+        selector, _, commit = line.partition(" ")
+        if commit.strip() == stash_ref:
+            return selector.strip()
+    return None
+
+
+
+def _print_stash_cleanup_guidance(stash_ref: str, stash_selector: Optional[str] = None) -> None:
+    print("  Check `git status` first so you don't accidentally reapply the same change twice.")
+    print("  Find the saved entry with: git stash list --format='%gd %H %s'")
+    if stash_selector:
+        print(f"  Remove it with: git stash drop {stash_selector}")
+    else:
+        print(f"  Look for commit {stash_ref}, then drop its selector with: git stash drop stash@{{N}}")
+
+
+
+def _restore_stashed_changes(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+    prompt_user: bool = False,
+) -> bool:
+    if prompt_user:
+        print()
+        print("⚠ Local changes were stashed before updating.")
+        print("  Restoring them may reapply local customizations onto the updated codebase.")
+        print("  Review the result afterward if Hermes behaves unexpectedly.")
+        print("Restore local changes now? [Y/n]")
+        response = input().strip().lower()
+        if response not in ("", "y", "yes"):
+            print("Skipped restoring local changes.")
+            print("Your changes are still preserved in git stash.")
+            print(f"Restore manually with: git stash apply {stash_ref}")
+            return False
+
+    print("→ Restoring local changes...")
+    restore = subprocess.run(
+        git_cmd + ["stash", "apply", stash_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if restore.returncode != 0:
+        print("✗ Update pulled new code, but restoring local changes failed.")
+        if restore.stdout.strip():
+            print(restore.stdout.strip())
+        if restore.stderr.strip():
+            print(restore.stderr.strip())
+        print("Your changes are still preserved in git stash.")
+        print(f"Resolve manually with: git stash apply {stash_ref}")
+        sys.exit(1)
+
+    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
+    if stash_selector is None:
+        print("⚠ Local changes were restored, but Hermes couldn't find the stash entry to drop.")
+        print("  The stash was left in place. You can remove it manually after checking the result.")
+        _print_stash_cleanup_guidance(stash_ref)
+    else:
+        drop = subprocess.run(
+            git_cmd + ["stash", "drop", stash_selector],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if drop.returncode != 0:
+            print("⚠ Local changes were restored, but Hermes couldn't drop the saved stash entry.")
+            if drop.stdout.strip():
+                print(drop.stdout.strip())
+            if drop.stderr.strip():
+                print(drop.stderr.strip())
+            print("  The stash was left in place. You can remove it manually after checking the result.")
+            _print_stash_cleanup_guidance(stash_ref, stash_selector)
+
+    print("⚠ Local changes were restored on top of the updated codebase.")
+    print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
+    return True
+
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
-    import subprocess
     import shutil
     
     print("⚕ Updating Hermes Agent...")
@@ -1058,7 +2151,15 @@ def cmd_update(args):
             check=True
         )
         branch = result.stdout.strip()
-        
+
+        # Fall back to main if the current branch doesn't exist on the remote
+        verify = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        )
+        if verify.returncode != 0:
+            branch = "main"
+
         # Check if there are updates
         result = subprocess.run(
             git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
@@ -1074,8 +2175,21 @@ def cmd_update(args):
             return
         
         print(f"→ Found {commit_count} new commit(s)")
+
+        auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+        prompt_for_restore = auto_stash_ref is not None and sys.stdin.isatty() and sys.stdout.isatty()
+
         print("→ Pulling updates...")
-        subprocess.run(git_cmd + ["pull", "origin", branch], cwd=PROJECT_ROOT, check=True)
+        try:
+            subprocess.run(git_cmd + ["pull", "origin", branch], cwd=PROJECT_ROOT, check=True)
+        finally:
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                )
         
         # Reinstall Python dependencies (prefer uv for speed, fall back to pip)
         print("→ Updating Python dependencies...")
@@ -1199,6 +2313,44 @@ def cmd_update(args):
             sys.exit(1)
 
 
+def _coalesce_session_name_args(argv: list) -> list:
+    """Join unquoted multi-word session names after -c/--continue and -r/--resume.
+
+    When a user types ``hermes -c Pokemon Agent Dev`` without quoting the
+    session name, argparse sees three separate tokens.  This function merges
+    them into a single argument so argparse receives
+    ``['-c', 'Pokemon Agent Dev']`` instead.
+
+    Tokens are collected after the flag until we hit another flag (``-*``)
+    or a known top-level subcommand.
+    """
+    _SUBCOMMANDS = {
+        "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
+        "status", "cron", "doctor", "config", "pairing", "skills", "tools",
+        "sessions", "insights", "version", "update", "uninstall",
+    }
+    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
+
+    result = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _SESSION_FLAGS:
+            result.append(token)
+            i += 1
+            # Collect subsequent non-flag, non-subcommand tokens as one name
+            parts: list = []
+            while i < len(argv) and not argv[i].startswith("-") and argv[i] not in _SUBCOMMANDS:
+                parts.append(argv[i])
+                i += 1
+            if parts:
+                result.append(" ".join(parts))
+        else:
+            result.append(token)
+            i += 1
+    return result
+
+
 def main():
     """Main entry point for hermes CLI."""
     parser = argparse.ArgumentParser(
@@ -1209,8 +2361,9 @@ def main():
 Examples:
     hermes                        Start interactive chat
     hermes chat -q "Hello"        Single query mode
-    hermes --continue             Resume the most recent session
-    hermes --resume <session_id>  Resume a specific session
+    hermes -c                     Resume the most recent session
+    hermes -c "my project"        Resume a session by name (latest in lineage)
+    hermes --resume <session_id>  Resume a specific session by ID
     hermes setup                  Run setup wizard
     hermes logout                 Clear stored authentication
     hermes model                  Select default model
@@ -1218,9 +2371,12 @@ Examples:
     hermes config edit            Edit config in $EDITOR
     hermes config set model gpt-4 Set a config value
     hermes gateway                Run messaging gateway
+    hermes -s hermes-agent-dev,github-auth
     hermes -w                     Start in isolated git worktree
-    hermes gateway install        Install as system service
+    hermes gateway install        Install gateway background service
     hermes sessions list          List past sessions
+    hermes sessions browse        Interactive session picker
+    hermes sessions rename ID T   Rename/title a session
     hermes update                 Update to latest version
 
 For more help on a command:
@@ -1235,22 +2391,42 @@ For more help on a command:
     )
     parser.add_argument(
         "--resume", "-r",
-        metavar="SESSION_ID",
+        metavar="SESSION",
         default=None,
-        help="Resume a previous session by ID (shortcut for: hermes chat --resume ID)"
+        help="Resume a previous session by ID or title"
     )
     parser.add_argument(
         "--continue", "-c",
         dest="continue_last",
-        action="store_true",
-        default=False,
-        help="Resume the most recent CLI session"
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="SESSION_NAME",
+        help="Resume a session by name, or the most recent if no name given"
     )
     parser.add_argument(
         "--worktree", "-w",
         action="store_true",
         default=False,
         help="Run in an isolated git worktree (for parallel agents)"
+    )
+    parser.add_argument(
+        "--skills", "-s",
+        action="append",
+        default=None,
+        help="Preload one or more skills for the session (repeat flag or comma-separate)"
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        default=False,
+        help="Bypass all dangerous command approval prompts (use at your own risk)"
+    )
+    parser.add_argument(
+        "--pass-session-id",
+        action="store_true",
+        default=False,
+        help="Include the session ID in the agent's system prompt"
     )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -1276,8 +2452,14 @@ For more help on a command:
         help="Comma-separated toolsets to enable"
     )
     chat_parser.add_argument(
+        "-s", "--skills",
+        action="append",
+        default=None,
+        help="Preload one or more skills for the session (repeat flag or comma-separate)"
+    )
+    chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "anthropic", "zai", "kimi-coding", "minimax", "minimax-cn"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -1287,6 +2469,11 @@ For more help on a command:
         help="Verbose output"
     )
     chat_parser.add_argument(
+        "-Q", "--quiet",
+        action="store_true",
+        help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info."
+    )
+    chat_parser.add_argument(
         "--resume", "-r",
         metavar="SESSION_ID",
         help="Resume a previous session by ID (shown on exit)"
@@ -1294,15 +2481,35 @@ For more help on a command:
     chat_parser.add_argument(
         "--continue", "-c",
         dest="continue_last",
-        action="store_true",
-        default=False,
-        help="Resume the most recent CLI session"
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="SESSION_NAME",
+        help="Resume a session by name, or the most recent if no name given"
     )
     chat_parser.add_argument(
         "--worktree", "-w",
         action="store_true",
         default=False,
         help="Run in an isolated git worktree (for parallel agents on the same repo)"
+    )
+    chat_parser.add_argument(
+        "--checkpoints",
+        action="store_true",
+        default=False,
+        help="Enable filesystem checkpoints before destructive file operations (use /rollback to restore)"
+    )
+    chat_parser.add_argument(
+        "--yolo",
+        action="store_true",
+        default=False,
+        help="Bypass all dangerous command approval prompts (use at your own risk)"
+    )
+    chat_parser.add_argument(
+        "--pass-session-id",
+        action="store_true",
+        default=False,
+        help="Include the session ID in the agent's system prompt"
     )
     chat_parser.set_defaults(func=cmd_chat)
 
@@ -1334,23 +2541,30 @@ For more help on a command:
     
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
+    gateway_start.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     
     # gateway stop
     gateway_stop = gateway_subparsers.add_parser("stop", help="Stop gateway service")
+    gateway_stop.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")
+    gateway_restart.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     gateway_status.add_argument("--deep", action="store_true", help="Deep status check")
+    gateway_status.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     
     # gateway install
     gateway_install = gateway_subparsers.add_parser("install", help="Install gateway as service")
     gateway_install.add_argument("--force", action="store_true", help="Force reinstall")
+    gateway_install.add_argument("--system", action="store_true", help="Install as a Linux system-level service (starts at boot)")
+    gateway_install.add_argument("--run-as-user", dest="run_as_user", help="User account the Linux system service should run as")
     
     # gateway uninstall
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")
+    gateway_uninstall.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
 
     # gateway setup
     gateway_setup = gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
@@ -1498,13 +2712,48 @@ For more help on a command:
     # cron list
     cron_list = cron_subparsers.add_parser("list", help="List scheduled jobs")
     cron_list.add_argument("--all", action="store_true", help="Include disabled jobs")
-    
+
+    # cron create/add
+    cron_create = cron_subparsers.add_parser("create", aliases=["add"], help="Create a scheduled job")
+    cron_create.add_argument("schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'")
+    cron_create.add_argument("prompt", nargs="?", help="Optional self-contained prompt or task instruction")
+    cron_create.add_argument("--name", help="Optional human-friendly job name")
+    cron_create.add_argument("--deliver", help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id")
+    cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
+    cron_create.add_argument("--skill", dest="skills", action="append", help="Attach a skill. Repeat to add multiple skills.")
+
+    # cron edit
+    cron_edit = cron_subparsers.add_parser("edit", help="Edit an existing scheduled job")
+    cron_edit.add_argument("job_id", help="Job ID to edit")
+    cron_edit.add_argument("--schedule", help="New schedule")
+    cron_edit.add_argument("--prompt", help="New prompt/task instruction")
+    cron_edit.add_argument("--name", help="New job name")
+    cron_edit.add_argument("--deliver", help="New delivery target")
+    cron_edit.add_argument("--repeat", type=int, help="New repeat count")
+    cron_edit.add_argument("--skill", dest="skills", action="append", help="Replace the job's skills with this set. Repeat to attach multiple skills.")
+    cron_edit.add_argument("--add-skill", dest="add_skills", action="append", help="Append a skill without replacing the existing list. Repeatable.")
+    cron_edit.add_argument("--remove-skill", dest="remove_skills", action="append", help="Remove a specific attached skill. Repeatable.")
+    cron_edit.add_argument("--clear-skills", action="store_true", help="Remove all attached skills from the job")
+
+    # lifecycle actions
+    cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
+    cron_pause.add_argument("job_id", help="Job ID to pause")
+
+    cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
+    cron_resume.add_argument("job_id", help="Job ID to resume")
+
+    cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
+    cron_run.add_argument("job_id", help="Job ID to trigger")
+
+    cron_remove = cron_subparsers.add_parser("remove", aliases=["rm", "delete"], help="Remove a scheduled job")
+    cron_remove.add_argument("job_id", help="Job ID to remove")
+
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
-    
+
     # cron tick (mostly for debugging)
     cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
-    
+
     cron_parser.set_defaults(func=cmd_cron)
     
     # =========================================================================
@@ -1590,8 +2839,8 @@ For more help on a command:
     # =========================================================================
     skills_parser = subparsers.add_parser(
         "skills",
-        help="Skills Hub — search, install, and manage skills from online registries",
-        description="Search, install, inspect, audit, and manage skills from GitHub, ClawHub, and other registries."
+        help="Search, install, configure, and manage skills",
+        description="Search, install, inspect, audit, configure, and manage skills from skills.sh, well-known agent skill endpoints, GitHub, ClawHub, and other registries."
     )
     skills_subparsers = skills_parser.add_subparsers(dest="skills_action")
 
@@ -1599,24 +2848,30 @@ For more help on a command:
     skills_browse.add_argument("--page", type=int, default=1, help="Page number (default: 1)")
     skills_browse.add_argument("--size", type=int, default=20, help="Results per page (default: 20)")
     skills_browse.add_argument("--source", default="all",
-                               choices=["all", "official", "github", "clawhub", "lobehub"],
+                               choices=["all", "official", "skills-sh", "well-known", "github", "clawhub", "lobehub"],
                                help="Filter by source (default: all)")
 
     skills_search = skills_subparsers.add_parser("search", help="Search skill registries")
     skills_search.add_argument("query", help="Search query")
-    skills_search.add_argument("--source", default="all", choices=["all", "official", "github", "clawhub", "lobehub"])
+    skills_search.add_argument("--source", default="all", choices=["all", "official", "skills-sh", "well-known", "github", "clawhub", "lobehub"])
     skills_search.add_argument("--limit", type=int, default=10, help="Max results")
 
     skills_install = skills_subparsers.add_parser("install", help="Install a skill")
     skills_install.add_argument("identifier", help="Skill identifier (e.g. openai/skills/skill-creator)")
     skills_install.add_argument("--category", default="", help="Category folder to install into")
-    skills_install.add_argument("--force", action="store_true", help="Install despite caution verdict")
+    skills_install.add_argument("--force", "--yes", "-y", dest="force", action="store_true", help="Install despite blocked scan verdict")
 
     skills_inspect = skills_subparsers.add_parser("inspect", help="Preview a skill without installing")
     skills_inspect.add_argument("identifier", help="Skill identifier")
 
     skills_list = skills_subparsers.add_parser("list", help="List installed skills")
-    skills_list.add_argument("--source", default="all", choices=["all", "hub", "builtin"])
+    skills_list.add_argument("--source", default="all", choices=["all", "hub", "builtin", "local"])
+
+    skills_check = skills_subparsers.add_parser("check", help="Check installed hub skills for updates")
+    skills_check.add_argument("name", nargs="?", help="Specific skill to check (default: all)")
+
+    skills_update = skills_subparsers.add_parser("update", help="Update installed hub skills")
+    skills_update.add_argument("name", nargs="?", help="Specific skill to update (default: all outdated skills)")
 
     skills_audit = skills_subparsers.add_parser("audit", help="Re-scan installed hub skills")
     skills_audit.add_argument("name", nargs="?", help="Specific skill to audit (default: all)")
@@ -1645,11 +2900,107 @@ For more help on a command:
     tap_rm = tap_subparsers.add_parser("remove", help="Remove a tap")
     tap_rm.add_argument("name", help="Tap name to remove")
 
+    # config sub-action: interactive enable/disable
+    skills_subparsers.add_parser("config", help="Interactive skill configuration — enable/disable individual skills")
+
     def cmd_skills(args):
-        from hermes_cli.skills_hub import skills_command
-        skills_command(args)
+        # Route 'config' action to skills_config module
+        if getattr(args, 'skills_action', None) == 'config':
+            from hermes_cli.skills_config import skills_command as skills_config_command
+            skills_config_command(args)
+        else:
+            from hermes_cli.skills_hub import skills_command
+            skills_command(args)
 
     skills_parser.set_defaults(func=cmd_skills)
+
+    # =========================================================================
+    # honcho command
+    # =========================================================================
+    honcho_parser = subparsers.add_parser(
+        "honcho",
+        help="Manage Honcho AI memory integration",
+        description=(
+            "Honcho is a memory layer that persists across sessions.\n\n"
+            "Each conversation is stored as a peer interaction in a workspace. "
+            "Honcho builds a representation of the user over time — conclusions, "
+            "patterns, context — and surfaces the relevant slice at the start of "
+            "each turn so Hermes knows who you are without you having to repeat yourself.\n\n"
+            "Modes: hybrid (Honcho + local MEMORY.md), honcho (Honcho only), "
+            "local (MEMORY.md only). Write frequency is configurable so memory "
+            "writes never block the response."
+        ),
+        formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+    )
+    honcho_subparsers = honcho_parser.add_subparsers(dest="honcho_command")
+
+    honcho_subparsers.add_parser("setup", help="Interactive setup wizard for Honcho integration")
+    honcho_subparsers.add_parser("status", help="Show current Honcho config and connection status")
+    honcho_subparsers.add_parser("sessions", help="List known Honcho session mappings")
+
+    honcho_map = honcho_subparsers.add_parser(
+        "map", help="Map current directory to a Honcho session name (no arg = list mappings)"
+    )
+    honcho_map.add_argument(
+        "session_name", nargs="?", default=None,
+        help="Session name to associate with this directory. Omit to list current mappings.",
+    )
+
+    honcho_peer = honcho_subparsers.add_parser(
+        "peer", help="Show or update peer names and dialectic reasoning level"
+    )
+    honcho_peer.add_argument("--user", metavar="NAME", help="Set user peer name")
+    honcho_peer.add_argument("--ai", metavar="NAME", help="Set AI peer name")
+    honcho_peer.add_argument(
+        "--reasoning",
+        metavar="LEVEL",
+        choices=("minimal", "low", "medium", "high", "max"),
+        help="Set default dialectic reasoning level (minimal/low/medium/high/max)",
+    )
+
+    honcho_mode = honcho_subparsers.add_parser(
+        "mode", help="Show or set memory mode (hybrid/honcho/local)"
+    )
+    honcho_mode.add_argument(
+        "mode", nargs="?", metavar="MODE",
+        choices=("hybrid", "honcho", "local"),
+        help="Memory mode to set (hybrid/honcho/local). Omit to show current.",
+    )
+
+    honcho_tokens = honcho_subparsers.add_parser(
+        "tokens", help="Show or set token budget for context and dialectic"
+    )
+    honcho_tokens.add_argument(
+        "--context", type=int, metavar="N",
+        help="Max tokens Honcho returns from session.context() per turn",
+    )
+    honcho_tokens.add_argument(
+        "--dialectic", type=int, metavar="N",
+        help="Max chars of dialectic result to inject into system prompt",
+    )
+
+    honcho_identity = honcho_subparsers.add_parser(
+        "identity", help="Seed or show the AI peer's Honcho identity representation"
+    )
+    honcho_identity.add_argument(
+        "file", nargs="?", default=None,
+        help="Path to file to seed from (e.g. SOUL.md). Omit to show usage.",
+    )
+    honcho_identity.add_argument(
+        "--show", action="store_true",
+        help="Show current AI peer representation from Honcho",
+    )
+
+    honcho_subparsers.add_parser(
+        "migrate",
+        help="Step-by-step migration guide from openclaw-honcho to Hermes Honcho",
+    )
+
+    def cmd_honcho(args):
+        from honcho_integration.cli import honcho_command
+        honcho_command(args)
+
+    honcho_parser.set_defaults(func=cmd_honcho)
 
     # =========================================================================
     # tools command
@@ -1659,19 +3010,23 @@ For more help on a command:
         help="Configure which tools are enabled per platform",
         description="Interactive tool configuration — enable/disable tools for CLI, Telegram, Discord, etc."
     )
+    tools_parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print a summary of enabled tools per platform and exit"
+    )
 
     def cmd_tools(args):
         from hermes_cli.tools_config import tools_command
         tools_command(args)
 
     tools_parser.set_defaults(func=cmd_tools)
-
     # =========================================================================
     # sessions command
     # =========================================================================
     sessions_parser = subparsers.add_parser(
         "sessions",
-        help="Manage session history (list, export, prune, delete)",
+        help="Manage session history (list, rename, export, prune, delete)",
         description="View and manage the SQLite session store"
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
@@ -1696,6 +3051,17 @@ For more help on a command:
 
     sessions_stats = sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
+    sessions_rename = sessions_subparsers.add_parser("rename", help="Set or change a session's title")
+    sessions_rename.add_argument("session_id", help="Session ID to rename")
+    sessions_rename.add_argument("title", nargs="+", help="New title for the session")
+
+    sessions_browse = sessions_subparsers.add_parser(
+        "browse",
+        help="Interactive session picker — browse, search, and resume sessions",
+    )
+    sessions_browse.add_argument("--source", help="Filter by source (cli, telegram, discord, etc.)")
+    sessions_browse.add_argument("--limit", type=int, default=50, help="Max sessions to load (default: 50)")
+
     def cmd_sessions(args):
         import json as _json
         try:
@@ -1708,43 +3074,60 @@ For more help on a command:
         action = args.sessions_action
 
         if action == "list":
-            sessions = db.search_sessions(source=args.source, limit=args.limit)
+            sessions = db.list_sessions_rich(source=args.source, limit=args.limit)
             if not sessions:
                 print("No sessions found.")
                 return
-            print(f"{'ID':<30} {'Source':<12} {'Model':<30} {'Messages':>8} {'Started'}")
-            print("─" * 100)
-            from datetime import datetime
+            has_titles = any(s.get("title") for s in sessions)
+            if has_titles:
+                print(f"{'Title':<22} {'Preview':<40} {'Last Active':<13} {'ID'}")
+                print("─" * 100)
+            else:
+                print(f"{'Preview':<50} {'Last Active':<13} {'Src':<6} {'ID'}")
+                print("─" * 90)
             for s in sessions:
-                started = datetime.fromtimestamp(s["started_at"]).strftime("%Y-%m-%d %H:%M") if s["started_at"] else "?"
-                model = (s.get("model") or "?")[:28]
-                ended = " (ended)" if s.get("ended_at") else ""
-                print(f"{s['id']:<30} {s['source']:<12} {model:<30} {s['message_count']:>8} {started}{ended}")
+                last_active = _relative_time(s.get("last_active"))
+                preview = s.get("preview", "")[:38] if has_titles else s.get("preview", "")[:48]
+                if has_titles:
+                    title = (s.get("title") or "—")[:20]
+                    sid = s["id"][:20]
+                    print(f"{title:<22} {preview:<40} {last_active:<13} {sid}")
+                else:
+                    sid = s["id"][:20]
+                    print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
 
         elif action == "export":
             if args.session_id:
-                data = db.export_session(args.session_id)
+                resolved_session_id = db.resolve_session_id(args.session_id)
+                if not resolved_session_id:
+                    print(f"Session '{args.session_id}' not found.")
+                    return
+                data = db.export_session(resolved_session_id)
                 if not data:
                     print(f"Session '{args.session_id}' not found.")
                     return
-                with open(args.output, "w") as f:
+                with open(args.output, "w", encoding="utf-8") as f:
                     f.write(_json.dumps(data, ensure_ascii=False) + "\n")
                 print(f"Exported 1 session to {args.output}")
             else:
                 sessions = db.export_all(source=args.source)
-                with open(args.output, "w") as f:
+                with open(args.output, "w", encoding="utf-8") as f:
                     for s in sessions:
                         f.write(_json.dumps(s, ensure_ascii=False) + "\n")
                 print(f"Exported {len(sessions)} sessions to {args.output}")
 
         elif action == "delete":
+            resolved_session_id = db.resolve_session_id(args.session_id)
+            if not resolved_session_id:
+                print(f"Session '{args.session_id}' not found.")
+                return
             if not args.yes:
-                confirm = input(f"Delete session '{args.session_id}' and all its messages? [y/N] ")
+                confirm = input(f"Delete session '{resolved_session_id}' and all its messages? [y/N] ")
                 if confirm.lower() not in ("y", "yes"):
                     print("Cancelled.")
                     return
-            if db.delete_session(args.session_id):
-                print(f"Deleted session '{args.session_id}'.")
+            if db.delete_session(resolved_session_id):
+                print(f"Deleted session '{resolved_session_id}'.")
             else:
                 print(f"Session '{args.session_id}' not found.")
 
@@ -1759,6 +3142,48 @@ For more help on a command:
             count = db.prune_sessions(older_than_days=days, source=args.source)
             print(f"Pruned {count} session(s).")
 
+        elif action == "rename":
+            resolved_session_id = db.resolve_session_id(args.session_id)
+            if not resolved_session_id:
+                print(f"Session '{args.session_id}' not found.")
+                return
+            title = " ".join(args.title)
+            try:
+                if db.set_session_title(resolved_session_id, title):
+                    print(f"Session '{resolved_session_id}' renamed to: {title}")
+                else:
+                    print(f"Session '{args.session_id}' not found.")
+            except ValueError as e:
+                print(f"Error: {e}")
+
+        elif action == "browse":
+            limit = getattr(args, "limit", 50) or 50
+            source = getattr(args, "source", None)
+            sessions = db.list_sessions_rich(source=source, limit=limit)
+            db.close()
+            if not sessions:
+                print("No sessions found.")
+                return
+
+            selected_id = _session_browse_picker(sessions)
+            if not selected_id:
+                print("Cancelled.")
+                return
+
+            # Launch hermes --resume <id> by replacing the current process
+            print(f"Resuming session: {selected_id}")
+            import shutil
+            hermes_bin = shutil.which("hermes")
+            if hermes_bin:
+                os.execvp(hermes_bin, ["hermes", "--resume", selected_id])
+            else:
+                # Fallback: re-invoke via python -m
+                os.execvp(
+                    sys.executable,
+                    [sys.executable, "-m", "hermes_cli.main", "--resume", selected_id],
+                )
+            return  # won't reach here after execvp
+
         elif action == "stats":
             total = db.session_count()
             msgs = db.message_count()
@@ -1768,7 +3193,6 @@ For more help on a command:
                 c = db.session_count(source=src)
                 if c > 0:
                     print(f"  {src}: {c} sessions")
-            import os
             db_path = db.db_path
             if db_path.exists():
                 size_mb = os.path.getsize(db_path) / (1024 * 1024)
@@ -1808,6 +3232,69 @@ For more help on a command:
     insights_parser.set_defaults(func=cmd_insights)
 
     # =========================================================================
+    # claw command (OpenClaw migration)
+    # =========================================================================
+    claw_parser = subparsers.add_parser(
+        "claw",
+        help="OpenClaw migration tools",
+        description="Migrate settings, memories, skills, and API keys from OpenClaw to Hermes"
+    )
+    claw_subparsers = claw_parser.add_subparsers(dest="claw_action")
+
+    # claw migrate
+    claw_migrate = claw_subparsers.add_parser(
+        "migrate",
+        help="Migrate from OpenClaw to Hermes",
+        description="Import settings, memories, skills, and API keys from an OpenClaw installation"
+    )
+    claw_migrate.add_argument(
+        "--source",
+        help="Path to OpenClaw directory (default: ~/.openclaw)"
+    )
+    claw_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be migrated without making changes"
+    )
+    claw_migrate.add_argument(
+        "--preset",
+        choices=["user-data", "full"],
+        default="full",
+        help="Migration preset (default: full). 'user-data' excludes secrets"
+    )
+    claw_migrate.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing files (default: skip conflicts)"
+    )
+    claw_migrate.add_argument(
+        "--migrate-secrets",
+        action="store_true",
+        help="Include allowlisted secrets (TELEGRAM_BOT_TOKEN, API keys, etc.)"
+    )
+    claw_migrate.add_argument(
+        "--workspace-target",
+        help="Absolute path to copy workspace instructions into"
+    )
+    claw_migrate.add_argument(
+        "--skill-conflict",
+        choices=["skip", "overwrite", "rename"],
+        default="skip",
+        help="How to handle skill name conflicts (default: skip)"
+    )
+    claw_migrate.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompts"
+    )
+
+    def cmd_claw(args):
+        from hermes_cli.claw import claw_command
+        claw_command(args)
+
+    claw_parser.set_defaults(func=cmd_claw)
+
+    # =========================================================================
     # version command
     # =========================================================================
     version_parser = subparsers.add_parser(
@@ -1845,11 +3332,36 @@ For more help on a command:
         help="Skip confirmation prompts"
     )
     uninstall_parser.set_defaults(func=cmd_uninstall)
+
+    # =========================================================================
+    # acp command
+    # =========================================================================
+    acp_parser = subparsers.add_parser(
+        "acp",
+        help="Run Hermes Agent as an ACP (Agent Client Protocol) server",
+        description="Start Hermes Agent in ACP mode for editor integration (VS Code, Zed, JetBrains)",
+    )
+
+    def cmd_acp(args):
+        """Launch Hermes Agent as an ACP server."""
+        try:
+            from acp_adapter.entry import main as acp_main
+            acp_main()
+        except ImportError:
+            print("ACP dependencies not installed.")
+            print("Install them with:  pip install -e '.[acp]'")
+            sys.exit(1)
+
+    acp_parser.set_defaults(func=cmd_acp)
     
     # =========================================================================
     # Parse and execute
     # =========================================================================
-    args = parser.parse_args()
+    # Pre-process argv so unquoted multi-word session names after -c / -r
+    # are merged into a single token before argparse sees them.
+    # e.g. ``hermes -c Pokemon Agent Dev`` → ``hermes -c 'Pokemon Agent Dev'``
+    _processed_argv = _coalesce_session_name_args(sys.argv[1:])
+    args = parser.parse_args(_processed_argv)
     
     # Handle --version flag
     if args.version:
@@ -1877,7 +3389,7 @@ For more help on a command:
         args.toolsets = None
         args.verbose = False
         args.resume = None
-        args.continue_last = False
+        args.continue_last = None
         if not hasattr(args, "worktree"):
             args.worktree = False
         cmd_chat(args)

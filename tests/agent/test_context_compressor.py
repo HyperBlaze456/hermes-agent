@@ -3,14 +3,13 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
 
 
 @pytest.fixture()
 def compressor():
     """Create a ContextCompressor with mocked dependencies."""
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000), \
-         patch("agent.context_compressor.get_text_auxiliary_client", return_value=(None, None)):
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         c = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -119,14 +118,11 @@ class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
 
     def test_none_content_does_not_crash(self):
-        mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: tool calls happened"
-        mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000), \
-             patch("agent.context_compressor.get_text_auxiliary_client", return_value=(mock_client, "test-model")):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -139,14 +135,14 @@ class TestGenerateSummaryNoneContent:
             {"role": "user", "content": "thanks"},
         ]
 
-        summary = c._generate_summary(messages)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
         assert isinstance(summary, str)
-        assert "CONTEXT SUMMARY" in summary
+        assert summary.startswith(SUMMARY_PREFIX)
 
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000), \
-             patch("agent.context_compressor.get_text_auxiliary_client", return_value=(None, None)):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         msgs = [{"role": "system", "content": None}] + [
@@ -157,6 +153,57 @@ class TestGenerateSummaryNoneContent:
         assert len(result) < len(msgs)
 
 
+class TestNonStringContent:
+    """Regression: content as dict (e.g., llama.cpp tool calls) must not crash."""
+
+    def test_dict_content_coerced_to_string(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = {"text": "some summary"}
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
+        assert isinstance(summary, str)
+        assert summary.startswith(SUMMARY_PREFIX)
+
+    def test_none_content_coerced_to_empty(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = None
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
+        # None content → empty string → standardized compaction handoff prefix added
+        assert summary is not None
+        assert summary == SUMMARY_PREFIX
+
+
+class TestSummaryPrefixNormalization:
+    def test_legacy_prefix_is_replaced(self):
+        summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
+        assert summary == f"{SUMMARY_PREFIX}\ndid work"
+
+    def test_existing_new_prefix_is_not_duplicated(self):
+        summary = ContextCompressor._with_summary_prefix(f"{SUMMARY_PREFIX}\ndid work")
+        assert summary == f"{SUMMARY_PREFIX}\ndid work"
+
+
 class TestCompressWithClient:
     def test_summarization_path(self):
         mock_client = MagicMock()
@@ -165,16 +212,16 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000), \
-             patch("agent.context_compressor.get_text_auxiliary_client", return_value=(mock_client, "test-model")):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(10)]
-        result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
 
         # Should have summary message in the middle
         contents = [m.get("content", "") for m in result]
-        assert any("CONTEXT SUMMARY" in c for c in contents)
+        assert any(c.startswith(SUMMARY_PREFIX) for c in contents)
         assert len(result) < len(msgs)
 
     def test_summarization_does_not_split_tool_call_pairs(self):
@@ -184,8 +231,7 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: compressed middle"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000), \
-             patch("agent.context_compressor.get_text_auxiliary_client", return_value=(mock_client, "test-model")):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -212,7 +258,8 @@ class TestCompressWithClient:
             {"role": "user", "content": "later 4"},
         ]
 
-        result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
 
         answered_ids = {
             msg.get("tool_call_id")
@@ -224,15 +271,70 @@ class TestCompressWithClient:
                 for tc in msg["tool_calls"]:
                     assert tc["id"] in answered_ids
 
-    def test_summarization_does_not_start_tail_with_tool_outputs(self):
+    def test_summary_role_avoids_consecutive_user_messages(self):
+        """Summary role should alternate with the last head message to avoid consecutive same-role messages."""
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: compressed middle"
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000), \
-             patch("agent.context_compressor.get_text_auxiliary_client", return_value=(mock_client, "test-model")):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        # Last head message (index 1) is "assistant" → summary should be "user"
+        msgs = [
+            {"role": "user", "content": "msg 0"},
+            {"role": "assistant", "content": "msg 1"},
+            {"role": "user", "content": "msg 2"},
+            {"role": "assistant", "content": "msg 3"},
+            {"role": "user", "content": "msg 4"},
+            {"role": "assistant", "content": "msg 5"},
+        ]
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+        summary_msg = [
+            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(summary_msg) == 1
+        assert summary_msg[0]["role"] == "user"
+
+    def test_summary_role_avoids_consecutive_user_when_head_ends_with_user(self):
+        """When last head message is 'user', summary must be 'assistant' to avoid two consecutive user messages."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
+        mock_client.chat.completions.create.return_value = mock_response
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2)
+
+        # Last head message (index 2) is "user" → summary should be "assistant"
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "user", "content": "msg 2"},  # last head — user
+            {"role": "assistant", "content": "msg 3"},
+            {"role": "user", "content": "msg 4"},
+            {"role": "assistant", "content": "msg 5"},
+            {"role": "user", "content": "msg 6"},
+            {"role": "assistant", "content": "msg 7"},
+        ]
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+        summary_msg = [
+            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(summary_msg) == 1
+        assert summary_msg[0]["role"] == "assistant"
+
+    def test_summarization_does_not_start_tail_with_tool_outputs(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: compressed middle"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -255,7 +357,8 @@ class TestCompressWithClient:
             {"role": "user", "content": "latest user"},
         ]
 
-        result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
 
         called_ids = {
             tc["id"]

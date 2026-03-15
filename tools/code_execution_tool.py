@@ -311,6 +311,7 @@ def _rpc_server_loop(
                         sys.stderr.close()
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
                 except Exception as exc:
+                    logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
                     result = json.dumps({"error": str(exc)})
 
                 tool_call_counter[0] += 1
@@ -327,15 +328,15 @@ def _rpc_server_loop(
                 conn.sendall((result + "\n").encode())
 
     except socket.timeout:
-        pass
-    except OSError:
-        pass
+        logger.debug("RPC listener socket timeout")
+    except OSError as e:
+        logger.debug("RPC listener socket error: %s", e, exc_info=True)
     finally:
         if conn:
             try:
                 conn.close()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("RPC conn close error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +386,11 @@ def execute_code(
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
-    sock_path = os.path.join(tempfile.gettempdir(), f"hermes_rpc_{uuid.uuid4().hex}.sock")
+    # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
+    # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
+    # On Linux, tempfile.gettempdir() already returns /tmp.
+    _sock_tmpdir = "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+    sock_path = os.path.join(_sock_tmpdir, f"hermes_rpc_{uuid.uuid4().hex}.sock")
 
     tool_call_log: list = []
     tool_call_counter = [0]  # mutable so the RPC thread can increment
@@ -393,9 +398,9 @@ def execute_code(
 
     try:
         # Write the auto-generated hermes_tools module
-        tools_src = generate_hermes_tools_module(
-            list(sandbox_tools) if enabled_tools else list(SANDBOX_ALLOWED_TOOLS)
-        )
+        # sandbox_tools is already the correct set (intersection with session
+        # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
+        tools_src = generate_hermes_tools_module(list(sandbox_tools))
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w") as f:
             f.write(tools_src)
 
@@ -435,6 +440,11 @@ def execute_code(
                 child_env[k] = v
         child_env["HERMES_RPC_SOCKET"] = sock_path
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Ensure the hermes-agent root is importable in the sandbox so
+        # modules like minisweagent_path are available to child scripts.
+        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _existing_pp = child_env.get("PYTHONPATH", "")
+        child_env["PYTHONPATH"] = _hermes_root + (os.pathsep + _existing_pp if _existing_pp else "")
         # Inject user's configured timezone so datetime.now() in sandboxed
         # code reflects the correct wall-clock time.
         _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -453,11 +463,17 @@ def execute_code(
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
-        stdout_chunks: list = []
         stderr_chunks: list = []
 
-        # Background readers to avoid pipe buffer deadlocks
+        # Background readers to avoid pipe buffer deadlocks.
+        # For stdout we use a head+tail strategy: keep the first HEAD_BYTES
+        # and a rolling window of the last TAIL_BYTES so the final print()
+        # output is never lost.  Stderr keeps head-only (errors appear early).
+        _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
+        _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
+
         def _drain(pipe, chunks, max_bytes):
+            """Simple head-only drain (used for stderr)."""
             total = 0
             try:
                 while True:
@@ -468,11 +484,51 @@ def execute_code(
                         keep = max_bytes - total
                         chunks.append(data[:keep])
                     total += len(data)
+            except (ValueError, OSError) as e:
+                logger.debug("Error reading process output: %s", e, exc_info=True)
+
+        stdout_total_bytes = [0]  # mutable ref for total bytes seen
+
+        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
+            """Drain stdout keeping both head and tail data."""
+            head_collected = 0
+            from collections import deque
+            tail_buf = deque()
+            tail_collected = 0
+            try:
+                while True:
+                    data = pipe.read(4096)
+                    if not data:
+                        break
+                    total_ref[0] += len(data)
+                    # Fill head buffer first
+                    if head_collected < head_bytes:
+                        keep = min(len(data), head_bytes - head_collected)
+                        head_chunks.append(data[:keep])
+                        head_collected += keep
+                        data = data[keep:]  # remaining goes to tail
+                        if not data:
+                            continue
+                    # Everything past head goes into rolling tail buffer
+                    tail_buf.append(data)
+                    tail_collected += len(data)
+                    # Evict old tail data to stay within tail_bytes budget
+                    while tail_collected > tail_bytes and tail_buf:
+                        oldest = tail_buf.popleft()
+                        tail_collected -= len(oldest)
             except (ValueError, OSError):
                 pass
+            # Transfer final tail to output list
+            tail_chunks.extend(tail_buf)
+
+        stdout_head_chunks: list = []
+        stdout_tail_chunks: list = []
 
         stdout_reader = threading.Thread(
-            target=_drain, args=(proc.stdout, stdout_chunks, MAX_STDOUT_BYTES), daemon=True
+            target=_drain_head_tail,
+            args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
+                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes),
+            daemon=True
         )
         stderr_reader = threading.Thread(
             target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
@@ -496,18 +552,27 @@ def execute_code(
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
-        stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stdout_head = b"".join(stdout_head_chunks).decode("utf-8", errors="replace")
+        stdout_tail = b"".join(stdout_tail_chunks).decode("utf-8", errors="replace")
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
-        # Truncation notice
-        if len(stdout_text) >= MAX_STDOUT_BYTES:
-            stdout_text = stdout_text[:MAX_STDOUT_BYTES] + "\n[output truncated at 50KB]"
+        # Assemble stdout with head+tail truncation
+        total_stdout = stdout_total_bytes[0]
+        if total_stdout > MAX_STDOUT_BYTES and stdout_tail:
+            omitted = total_stdout - len(stdout_head) - len(stdout_tail)
+            truncated_notice = (
+                f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
+                f"out of {total_stdout:,} total] ...\n\n"
+            )
+            stdout_text = stdout_head + truncated_notice + stdout_tail
+        else:
+            stdout_text = stdout_head + stdout_tail
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = round(time.monotonic() - exec_start, 2)
 
         # Wait for RPC thread to finish
-        server_sock.close()
+        server_sock.close()  # break accept() so thread exits promptly
         rpc_thread.join(timeout=3)
 
         # Build response
@@ -544,14 +609,18 @@ def execute_code(
     finally:
         # Cleanup temp dir and socket
         try:
+            server_sock.close()
+        except Exception as e:
+            logger.debug("Server socket close error: %s", e)
+        try:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception as e:
-            logger.debug("Could not clean temp dir: %s", e)
+            logger.debug("Could not clean temp dir: %s", e, exc_info=True)
         try:
             os.unlink(sock_path)
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug("Could not remove socket file: %s", e, exc_info=True)
 
 
 def _kill_process_group(proc, escalate: bool = False):
@@ -561,11 +630,12 @@ def _kill_process_group(proc, escalate: bool = False):
             proc.terminate()
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError) as e:
+        logger.debug("Could not kill process group: %s", e, exc_info=True)
         try:
             proc.kill()
-        except Exception as e:
-            logger.debug("Could not kill process: %s", e)
+        except Exception as e2:
+            logger.debug("Could not kill process: %s", e2, exc_info=True)
 
     if escalate:
         # Give the process 5s to exit after SIGTERM, then SIGKILL
@@ -577,11 +647,12 @@ def _kill_process_group(proc, escalate: bool = False):
                     proc.kill()
                 else:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError) as e:
+                logger.debug("Could not kill process group with SIGKILL: %s", e, exc_info=True)
                 try:
                     proc.kill()
-                except Exception as e:
-                    logger.debug("Could not kill process: %s", e)
+                except Exception as e2:
+                    logger.debug("Could not kill process: %s", e2, exc_info=True)
 
 
 def _load_config() -> dict:
@@ -643,7 +714,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None) -> dict:
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
-    import_str = ", ".join(import_examples) + ", ..."
+    if import_examples:
+        import_str = ", ".join(import_examples) + ", ..."
+    else:
+        import_str = "..."
 
     description = (
         "Run a Python script that can call Hermes tools programmatically. "

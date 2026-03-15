@@ -22,13 +22,7 @@ import os
 import logging
 from typing import Dict, Any, List, Optional, Union
 
-from openai import AsyncOpenAI, OpenAI
-
-from agent.auxiliary_client import get_async_text_auxiliary_client
-
-# Resolve the async auxiliary client at import time so we have the model slug.
-# Handles Codex Responses API adapter transparently.
-_async_aux_client, _SUMMARIZER_MODEL = get_async_text_auxiliary_client()
+from agent.auxiliary_client import async_call_llm
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
@@ -156,26 +150,22 @@ async def _summarize_session(
         f"Summarize this conversation with focus on: {query}"
     )
 
-    if _async_aux_client is None or _SUMMARIZER_MODEL is None:
-        logging.warning("No auxiliary model available for session summarization")
-        return None
-
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
-            _extra = get_auxiliary_extra_body()
-            response = await _async_aux_client.chat.completions.create(
-                model=_SUMMARIZER_MODEL,
+            response = await async_call_llm(
+                task="session_search",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                **({} if not _extra else {"extra_body": _extra}),
                 temperature=0.1,
-                **auxiliary_max_tokens_param(MAX_SUMMARY_TOKENS),
+                max_tokens=MAX_SUMMARY_TOKENS,
             )
             return response.choices[0].message.content.strip()
+        except RuntimeError:
+            logging.warning("No auxiliary model available for session summarization")
+            return None
         except Exception as e:
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
@@ -333,8 +323,6 @@ def session_search(
 
 def check_session_search_requirements() -> bool:
     """Requires SQLite state database and an auxiliary text model."""
-    if _async_aux_client is None:
-        return False
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
@@ -353,8 +341,8 @@ SESSION_SEARCH_SCHEMA = {
         "- The user references a project, person, or concept that seems familiar but isn't in memory\n"
         "- You want to check if you've solved a similar problem before\n"
         "- The user asks 'what did we do about X?' or 'how did we fix Y?'\n\n"
-        "Don't hesitate to search -- it's fast and cheap. Better to search and confirm "
-        "than to guess or ask the user to repeat themselves.\n\n"
+        "Don't hesitate to search when it is actually cross-session -- it's fast and cheap. "
+        "Better to search and confirm than to guess or ask the user to repeat themselves.\n\n"
         "Search syntax: keywords joined with OR for broad recall (elevenlabs OR baseten OR funding), "
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "

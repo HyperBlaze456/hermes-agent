@@ -26,6 +26,8 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
+from hermes_cli.config import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,7 +134,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         )
         self._session_path: Path = Path(config.extra.get(
             "session_path",
-            Path.home() / ".hermes" / "whatsapp" / "session"
+            get_hermes_home() / "whatsapp" / "session"
         ))
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -181,8 +183,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
             
             # Kill any orphaned bridge from a previous gateway run
             _kill_port_process(self._bridge_port)
-            import time
-            time.sleep(1)
+            import asyncio
+            await asyncio.sleep(1)
             
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
@@ -493,7 +495,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             file_name or os.path.basename(file_path),
         )
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
         if not self._running:
             return

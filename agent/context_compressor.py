@@ -9,13 +9,23 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import get_text_auxiliary_client
+from agent.auxiliary_client import call_llm
 from agent.model_metadata import (
     get_model_context_length,
     estimate_messages_tokens_rough,
 )
 
 logger = logging.getLogger(__name__)
+
+SUMMARY_PREFIX = (
+    "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted "
+    "to save context space. The summary below describes work that was "
+    "already completed, and the current session state may still reflect "
+    "that work (for example, files may already be changed). Use the summary "
+    "and the current state to continue from where things left off, and "
+    "avoid repeating work:"
+)
+LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
 
 class ContextCompressor:
@@ -28,7 +38,7 @@ class ContextCompressor:
     def __init__(
         self,
         model: str,
-        threshold_percent: float = 0.85,
+        threshold_percent: float = 0.50,
         protect_first_n: int = 3,
         protect_last_n: int = 4,
         summary_target_tokens: int = 2500,
@@ -53,8 +63,7 @@ class ContextCompressor:
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
 
-        self.client, default_model = get_text_auxiliary_client()
-        self.summary_model = summary_model_override or default_model
+        self.summary_model = summary_model_override or ""
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -103,101 +112,59 @@ class ContextCompressor:
             parts.append(f"[{role.upper()}]: {content}")
 
         content_to_summarize = "\n\n".join(parts)
-        prompt = f"""Summarize these conversation turns concisely. This summary will replace these turns in the conversation history.
+        prompt = f"""Create a concise handoff summary for a later assistant that will continue this conversation after earlier turns are compacted.
 
-Write from a neutral perspective describing:
+Describe:
 1. What actions were taken (tool calls, searches, file operations)
 2. Key information or results obtained
-3. Important decisions or findings
-4. Relevant data, file names, or outputs
+3. Important decisions, constraints, or user preferences
+4. Relevant data, file names, outputs, or next steps needed to continue
 
-Keep factual and informative. Target ~{self.summary_target_tokens} tokens.
+Keep it factual, concise, and focused on helping the next assistant resume without repeating work. Target ~{self.summary_target_tokens} tokens.
 
 ---
 TURNS TO SUMMARIZE:
 {content_to_summarize}
 ---
 
-Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
+Write only the summary body. Do not include any preamble or prefix; the system will add the handoff wrapper."""
 
-        # 1. Try the auxiliary model (cheap/fast)
-        if self.client:
-            try:
-                return self._call_summary_model(self.client, self.summary_model, prompt)
-            except Exception as e:
-                logging.warning(f"Failed to generate context summary with auxiliary model: {e}")
-
-        # 2. Fallback: try the user's main model endpoint
-        fallback_client, fallback_model = self._get_fallback_client()
-        if fallback_client is not None:
-            try:
-                logger.info("Retrying context summary with main model (%s)", fallback_model)
-                summary = self._call_summary_model(fallback_client, fallback_model, prompt)
-                self.client = fallback_client
-                self.summary_model = fallback_model
-                return summary
-            except Exception as fallback_err:
-                logging.warning(f"Main model summary also failed: {fallback_err}")
-
-        # 3. All models failed — return None so the caller drops turns without a summary
-        logging.warning("Context compression: no model available for summary. Middle turns will be dropped without summary.")
-        return None
-
-    def _call_summary_model(self, client, model: str, prompt: str) -> str:
-        """Make the actual LLM call to generate a summary. Raises on failure."""
-        kwargs = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "timeout": 30.0,
-        }
-        # Most providers (OpenRouter, local models) use max_tokens.
-        # Direct OpenAI with newer models (gpt-4o, o-series, gpt-5+)
-        # requires max_completion_tokens instead.
+        # Use the centralized LLM router — handles provider resolution,
+        # auth, and fallback internally.
         try:
-            kwargs["max_tokens"] = self.summary_target_tokens * 2
-            response = client.chat.completions.create(**kwargs)
-        except Exception as first_err:
-            if "max_tokens" in str(first_err) or "unsupported_parameter" in str(first_err):
-                kwargs.pop("max_tokens", None)
-                kwargs["max_completion_tokens"] = self.summary_target_tokens * 2
-                response = client.chat.completions.create(**kwargs)
-            else:
-                raise
+            call_kwargs = {
+                "task": "compression",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": self.summary_target_tokens * 2,
+                "timeout": 30.0,
+            }
+            if self.summary_model:
+                call_kwargs["model"] = self.summary_model
+            response = call_llm(**call_kwargs)
+            content = response.choices[0].message.content
+            # Handle cases where content is not a string (e.g., dict from llama.cpp)
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+            summary = content.strip()
+            return self._with_summary_prefix(summary)
+        except RuntimeError:
+            logging.warning("Context compression: no provider available for "
+                            "summary. Middle turns will be dropped without summary.")
+            return None
+        except Exception as e:
+            logging.warning("Failed to generate context summary: %s", e)
+            return None
 
-        summary = response.choices[0].message.content.strip()
-        if not summary.startswith("[CONTEXT SUMMARY]:"):
-            summary = "[CONTEXT SUMMARY]: " + summary
-        return summary
-
-    def _get_fallback_client(self):
-        """Try to build a fallback client from the main model's endpoint config.
-
-        When the primary auxiliary client fails (e.g. stale OpenRouter key), this
-        creates a client using the user's active custom endpoint (OPENAI_BASE_URL)
-        so compression can still produce a real summary instead of a static string.
-
-        Returns (client, model) or (None, None).
-        """
-        custom_base = os.getenv("OPENAI_BASE_URL")
-        custom_key = os.getenv("OPENAI_API_KEY")
-        if not custom_base or not custom_key:
-            return None, None
-
-        # Don't fallback to the same provider that just failed
-        from hermes_constants import OPENROUTER_BASE_URL
-        if custom_base.rstrip("/") == OPENROUTER_BASE_URL.rstrip("/"):
-            return None, None
-
-        model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or self.model
-        try:
-            from openai import OpenAI as _OpenAI
-            client = _OpenAI(api_key=custom_key, base_url=custom_base)
-            logger.debug("Built fallback auxiliary client: %s via %s", model, custom_base)
-            return client, model
-        except Exception as exc:
-            logger.debug("Could not build fallback auxiliary client: %s", exc)
-            return None, None
+    @staticmethod
+    def _with_summary_prefix(summary: str) -> str:
+        """Normalize summary text to the current compaction handoff format."""
+        text = (summary or "").strip()
+        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
 
     # ------------------------------------------------------------------
     # Tool-call / tool-result pair integrity helpers
@@ -338,11 +305,16 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         for i in range(compress_start):
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system" and self.compression_count == 0:
-                msg["content"] = (msg.get("content") or "") + "\n\n[Note: Some earlier conversation turns may be summarized to preserve context space.]"
+                msg["content"] = (
+                    (msg.get("content") or "")
+                    + "\n\n[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]"
+                )
             compressed.append(msg)
 
         if summary:
-            compressed.append({"role": "user", "content": summary})
+            last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
+            summary_role = "user" if last_head_role in ("assistant", "tool") else "assistant"
+            compressed.append({"role": summary_role, "content": summary})
         else:
             if not self.quiet_mode:
                 print("   ⚠️  No summary model available — middle turns dropped without summary")

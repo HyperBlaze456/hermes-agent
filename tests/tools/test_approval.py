@@ -1,12 +1,17 @@
 """Tests for the dangerous command approval module."""
 
+from unittest.mock import patch as mock_patch
+
+import tools.approval as approval_module
 from tools.approval import (
     approve_session,
     clear_session,
     detect_dangerous_command,
     has_pending,
     is_approved,
+    load_permanent,
     pop_pending,
+    prompt_dangerous_approval,
     submit_pending,
 )
 
@@ -337,4 +342,134 @@ class TestFindExecFullPathRm:
         dangerous, key, desc = detect_dangerous_command("find . -name '*.py' -print")
         assert dangerous is False
         assert key is None
+
+
+class TestPatternKeyUniqueness:
+    """Bug: pattern_key is derived by splitting on \\b and taking [1], so
+    patterns starting with the same word (e.g. find -exec rm and find -delete)
+    produce the same key. Approving one silently approves the other."""
+
+    def test_find_exec_rm_and_find_delete_have_different_keys(self):
+        _, key_exec, _ = detect_dangerous_command("find . -exec rm {} \\;")
+        _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
+        assert key_exec != key_delete, (
+            f"find -exec rm and find -delete share key {key_exec!r} — "
+            "approving one silently approves the other"
+        )
+
+    def test_approving_find_exec_does_not_approve_find_delete(self):
+        """Session approval for find -exec rm must not carry over to find -delete."""
+        _, key_exec, _ = detect_dangerous_command("find . -exec rm {} \\;")
+        _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
+        session = "test_find_collision"
+        clear_session(session)
+        approve_session(session, key_exec)
+        assert is_approved(session, key_exec) is True
+        assert is_approved(session, key_delete) is False, (
+            "approving find -exec rm should not auto-approve find -delete"
+        )
+        clear_session(session)
+
+    def test_legacy_find_key_still_approves_find_exec(self):
+        """Old allowlist entry 'find' should keep approving the matching command."""
+        _, key_exec, _ = detect_dangerous_command("find . -exec rm {} \\;")
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            load_permanent({"find"})
+            assert is_approved("legacy-find", key_exec) is True
+
+    def test_legacy_find_key_still_approves_find_delete(self):
+        """Old colliding allowlist entry 'find' should remain backwards compatible."""
+        _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            load_permanent({"find"})
+            assert is_approved("legacy-find", key_delete) is True
+
+
+class TestViewFullCommand:
+    """Tests for the 'view full command' option in prompt_dangerous_approval."""
+
+    def test_view_then_once_fallback(self):
+        """Pressing 'v' shows the full command, then 'o' approves once."""
+        long_cmd = "rm -rf " + "a" * 200
+        inputs = iter(["v", "o"])
+        with mock_patch("builtins.input", side_effect=inputs):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "once"
+
+    def test_view_then_deny_fallback(self):
+        """Pressing 'v' shows the full command, then 'd' denies."""
+        long_cmd = "rm -rf " + "b" * 200
+        inputs = iter(["v", "d"])
+        with mock_patch("builtins.input", side_effect=inputs):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "deny"
+
+    def test_view_then_session_fallback(self):
+        """Pressing 'v' shows the full command, then 's' approves for session."""
+        long_cmd = "rm -rf " + "c" * 200
+        inputs = iter(["v", "s"])
+        with mock_patch("builtins.input", side_effect=inputs):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "session"
+
+    def test_view_then_always_fallback(self):
+        """Pressing 'v' shows the full command, then 'a' approves always."""
+        long_cmd = "rm -rf " + "d" * 200
+        inputs = iter(["v", "a"])
+        with mock_patch("builtins.input", side_effect=inputs):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "always"
+
+    def test_view_then_session_when_permanent_hidden(self):
+        """The view-full flow still works when allow_permanent=False."""
+        long_cmd = "rm -rf " + "d" * 200
+        inputs = iter(["v", "s"])
+        with mock_patch("builtins.input", side_effect=inputs):
+            result = prompt_dangerous_approval(
+                long_cmd,
+                "recursive delete",
+                allow_permanent=False,
+            )
+        assert result == "session"
+
+    def test_view_not_shown_for_short_command(self):
+        """Short commands don't offer the view option; 'v' falls through to deny."""
+        short_cmd = "rm -rf /tmp"
+        with mock_patch("builtins.input", return_value="v"):
+            result = prompt_dangerous_approval(short_cmd, "recursive delete")
+        # 'v' is not a valid choice for short commands, should deny
+        assert result == "deny"
+
+    def test_once_without_view(self):
+        """Directly pressing 'o' without viewing still works."""
+        long_cmd = "rm -rf " + "e" * 200
+        with mock_patch("builtins.input", return_value="o"):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "once"
+
+    def test_view_ignored_after_already_shown(self):
+        """After viewing once, 'v' on a now-untruncated display falls through to deny."""
+        long_cmd = "rm -rf " + "f" * 200
+        inputs = iter(["v", "v"])  # second 'v' should not match since is_truncated is False
+        with mock_patch("builtins.input", side_effect=inputs):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        # After first 'v', is_truncated becomes False, so second 'v' -> deny
+        assert result == "deny"
+
+
+class TestForkBombDetection:
+    """The fork bomb regex must match the classic :(){ :|:& };: pattern."""
+
+    def test_classic_fork_bomb(self):
+        dangerous, key, desc = detect_dangerous_command(":(){ :|:& };:")
+        assert dangerous is True, "classic fork bomb not detected"
+        assert "fork bomb" in desc.lower()
+
+    def test_fork_bomb_with_spaces(self):
+        dangerous, key, desc = detect_dangerous_command(":()  {  : | :&  } ; :")
+        assert dangerous is True, "fork bomb with extra spaces not detected"
+
+    def test_colon_in_safe_command_not_flagged(self):
+        dangerous, key, desc = detect_dangerous_command("echo hello:world")
+        assert dangerous is False
 

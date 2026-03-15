@@ -550,14 +550,58 @@ class TestConvertToPng:
         """BMP file should still be reported as success if no converter available."""
         dest = tmp_path / "img.png"
         dest.write_bytes(FAKE_BMP)  # it's a BMP but named .png
-        # Both Pillow and ImageMagick fail
-        with patch("hermes_cli.clipboard.subprocess.run", side_effect=FileNotFoundError):
-            # Pillow import fails
-            with pytest.raises(Exception):
-                from PIL import Image  # noqa — this may or may not work
-            # The function should still return True if file exists and has content
-            # (raw BMP is better than nothing)
-            assert dest.exists() and dest.stat().st_size > 0
+        # Both Pillow and ImageMagick unavailable
+        with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            with patch("hermes_cli.clipboard.subprocess.run", side_effect=FileNotFoundError):
+                result = _convert_to_png(dest)
+                # Raw BMP is better than nothing — function should return True
+                assert result is True
+                assert dest.exists() and dest.stat().st_size > 0
+
+    def test_imagemagick_failure_preserves_original(self, tmp_path):
+        """When ImageMagick convert fails, the original file must not be lost."""
+        dest = tmp_path / "img.png"
+        original_data = FAKE_BMP
+        dest.write_bytes(original_data)
+
+        def fake_run_fail(cmd, **kw):
+            # Simulate convert failing without producing output
+            return MagicMock(returncode=1)
+
+        with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            with patch("hermes_cli.clipboard.subprocess.run", side_effect=fake_run_fail):
+                _convert_to_png(dest)
+
+        # Original file must still exist with original content
+        assert dest.exists(), "Original file was lost after failed conversion"
+        assert dest.read_bytes() == original_data
+
+    def test_imagemagick_not_installed_preserves_original(self, tmp_path):
+        """When ImageMagick is not installed, the original file must not be lost."""
+        dest = tmp_path / "img.png"
+        original_data = FAKE_BMP
+        dest.write_bytes(original_data)
+
+        with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            with patch("hermes_cli.clipboard.subprocess.run", side_effect=FileNotFoundError):
+                _convert_to_png(dest)
+
+        assert dest.exists(), "Original file was lost when ImageMagick not installed"
+        assert dest.read_bytes() == original_data
+
+    def test_imagemagick_timeout_preserves_original(self, tmp_path):
+        """When ImageMagick times out, the original file must not be lost."""
+        import subprocess
+        dest = tmp_path / "img.png"
+        original_data = FAKE_BMP
+        dest.write_bytes(original_data)
+
+        with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            with patch("hermes_cli.clipboard.subprocess.run", side_effect=subprocess.TimeoutExpired("convert", 5)):
+                _convert_to_png(dest)
+
+        assert dest.exists(), "Original file was lost after timeout"
+        assert dest.read_bytes() == original_data
 
 
 # ── has_clipboard_image dispatch ─────────────────────────────────────────
@@ -764,7 +808,7 @@ class TestTryAttachClipboardImage:
         with patch("hermes_cli.clipboard.save_clipboard_image", return_value=True):
             cli._try_attach_clipboard_image()
         path = cli._attached_images[0]
-        assert path.parent == Path.home() / ".hermes" / "images"
+        assert path.parent == Path(os.environ["HERMES_HOME"]) / "images"
         assert path.name.startswith("clip_")
         assert path.suffix == ".png"
 

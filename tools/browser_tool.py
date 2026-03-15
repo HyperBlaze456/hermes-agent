@@ -53,6 +53,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import shutil
@@ -63,9 +64,15 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
-from agent.auxiliary_client import get_vision_auxiliary_client
+from agent.auxiliary_client import call_llm
 
 logger = logging.getLogger(__name__)
+
+# Standard PATH entries for environments with minimal PATH (e.g. systemd services)
+_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Throttle screenshot cleanup to avoid repeated full directory scans.
+_last_screenshot_cleanup_by_dir: dict[str, float] = {}
 
 # ============================================================================
 # Configuration
@@ -80,8 +87,15 @@ DEFAULT_SESSION_TIMEOUT = 300
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
-# Resolve vision auxiliary client for extraction/vision tasks
-_aux_vision_client, EXTRACTION_MODEL = get_vision_auxiliary_client()
+
+def _get_vision_model() -> Optional[str]:
+    """Model for browser_vision (screenshot analysis — multimodal)."""
+    return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+
+
+def _get_extraction_model() -> Optional[str]:
+    """Model for page snapshot text summarization — same as web_extract."""
+    return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
 def _is_local_mode() -> bool:
@@ -94,9 +108,27 @@ def _is_local_mode() -> bool:
     return not (os.environ.get("BROWSERBASE_API_KEY") and os.environ.get("BROWSERBASE_PROJECT_ID"))
 
 
+def _socket_safe_tmpdir() -> str:
+    """Return a short temp directory path suitable for Unix domain sockets.
+
+    macOS sets ``TMPDIR`` to ``/var/folders/xx/.../T/`` (~51 chars).  When we
+    append ``agent-browser-hermes_…`` the resulting socket path exceeds the
+    104-byte macOS limit for ``AF_UNIX`` addresses, causing agent-browser to
+    fail with "Failed to create socket directory" or silent screenshot failures.
+
+    Linux ``tempfile.gettempdir()`` already returns ``/tmp``, so this is a
+    no-op there.  On macOS we bypass ``TMPDIR`` and use ``/tmp`` directly
+    (symlink to ``/private/tmp``, sticky-bit protected, always available).
+    """
+    if sys.platform == "darwin":
+        return "/tmp"
+    return tempfile.gettempdir()
+
+
 # Track active sessions per task
 # Stores: session_name (always), bb_session_id + cdp_url (cloud mode only)
 _active_sessions: Dict[str, Dict[str, str]] = {}  # task_id -> {session_name, ...}
+_recording_sessions: set = set()  # task_ids with active recordings
 
 # Flag to track if cleanup has been done
 _cleanup_done = False
@@ -134,82 +166,27 @@ def _emergency_cleanup_all_sessions():
     if not _active_sessions:
         return
     
-    logger.info("Emergency cleanup: closing %s active session(s)...", len(_active_sessions))
-    
+    logger.info("Emergency cleanup: closing %s active session(s)...",
+                len(_active_sessions))
+
     try:
-        if _is_local_mode():
-            # Local mode: just close agent-browser sessions via CLI
-            for task_id, session_info in list(_active_sessions.items()):
-                session_name = session_info.get("session_name")
-                if session_name:
-                    try:
-                        browser_cmd = _find_agent_browser()
-                        task_socket_dir = os.path.join(
-                            tempfile.gettempdir(),
-                            f"agent-browser-{session_name}"
-                        )
-                        env = {**os.environ, "AGENT_BROWSER_SOCKET_DIR": task_socket_dir}
-                        subprocess.run(
-                            browser_cmd.split() + ["--session", session_name, "--json", "close"],
-                            capture_output=True, timeout=5, env=env,
-                        )
-                        logger.info("Closed local session %s", session_name)
-                    except Exception as e:
-                        logger.debug("Error closing local session %s: %s", session_name, e)
-        else:
-            # Cloud mode: release Browserbase sessions via API
-            api_key = os.environ.get("BROWSERBASE_API_KEY")
-            project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-
-            if not api_key or not project_id:
-                logger.warning("Cannot cleanup - missing BROWSERBASE credentials")
-                return
-
-            for task_id, session_info in list(_active_sessions.items()):
-                bb_session_id = session_info.get("bb_session_id")
-                if bb_session_id:
-                    try:
-                        response = requests.post(
-                            f"https://api.browserbase.com/v1/sessions/{bb_session_id}",
-                            headers={
-                                "X-BB-API-Key": api_key,
-                                "Content-Type": "application/json"
-                            },
-                            json={
-                                "projectId": project_id,
-                                "status": "REQUEST_RELEASE"
-                            },
-                            timeout=5  # Short timeout for cleanup
-                        )
-                        if response.status_code in (200, 201, 204):
-                            logger.info("Closed session %s", bb_session_id)
-                        else:
-                            logger.warning("Failed to close session %s: HTTP %s", bb_session_id, response.status_code)
-                    except Exception as e:
-                        logger.error("Error closing session %s: %s", bb_session_id, e)
-        
-        _active_sessions.clear()
+        cleanup_all_browsers()
     except Exception as e:
         logger.error("Emergency cleanup error: %s", e)
+    finally:
+        with _cleanup_lock:
+            _active_sessions.clear()
+            _session_last_activity.clear()
+        _recording_sessions.clear()
 
 
-def _signal_handler(signum, frame):
-    """Handle interrupt signals to cleanup sessions before exit."""
-    logger.warning("Received signal %s, cleaning up...", signum)
-    _emergency_cleanup_all_sessions()
-    sys.exit(128 + signum)
-
-
-# Register cleanup handlers
+# Register cleanup via atexit only.  Previous versions installed SIGINT/SIGTERM
+# handlers that called sys.exit(), but this conflicts with prompt_toolkit's
+# async event loop — a SystemExit raised inside a key-binding callback
+# corrupts the coroutine state and makes the process unkillable.  atexit
+# handlers run on any normal exit (including sys.exit), so browser sessions
+# are still cleaned up without hijacking signals.
 atexit.register(_emergency_cleanup_all_sessions)
-
-# Only register signal handlers in main process (not in multiprocessing workers)
-try:
-    if os.getpid() == os.getpgrp():  # Main process check
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-except (OSError, AttributeError):
-    pass  # Signal handling not available (e.g., Windows or worker process)
 
 
 # =============================================================================
@@ -431,9 +408,29 @@ BROWSER_TOOL_SCHEMAS = [
                 "question": {
                     "type": "string",
                     "description": "What you want to know about the page visually. Be specific about what you're looking for."
+                },
+                "annotate": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout."
                 }
             },
             "required": ["question"]
+        }
+    },
+    {
+        "name": "browser_console",
+        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "clear": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, clear the message buffers after reading"
+                }
+            },
+            "required": []
         }
     },
 ]
@@ -599,18 +596,14 @@ def _create_browserbase_session(task_id: str) -> Dict[str, str]:
 
 
 def _create_local_session(task_id: str) -> Dict[str, str]:
-    """Create a lightweight local browser session (no cloud API call).
-
-    Returns the same dict shape as ``_create_browserbase_session`` so the rest
-    of the code can treat both modes uniformly.
-    """
     import uuid
-    session_name = f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
-    logger.info("Created local browser session %s", session_name)
+    session_name = f"h_{uuid.uuid4().hex[:10]}"
+    logger.info("Created local browser session %s for task %s",
+                session_name, task_id)
     return {
         "session_name": session_name,
-        "bb_session_id": None,   # Not applicable in local mode
-        "cdp_url": None,         # Not applicable in local mode
+        "bb_session_id": None,
+        "cdp_url": None,
         "features": {"local": True},
     }
 
@@ -731,6 +724,27 @@ def _find_agent_browser() -> str:
     )
 
 
+def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
+    """Extract a screenshot file path from agent-browser human-readable output."""
+    if not text:
+        return None
+
+    patterns = [
+        r"Screenshot saved to ['\"](?P<path>/[^'\"]+?\.png)['\"]",
+        r"Screenshot saved to (?P<path>/\S+?\.png)(?:\s|$)",
+        r"(?P<path>/\S+?\.png)(?:\s|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            path = match.group("path").strip().strip("'\"")
+            if path:
+                return path
+
+    return None
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -755,6 +769,7 @@ def _run_browser_command(
     try:
         browser_cmd = _find_agent_browser()
     except FileNotFoundError as e:
+        logger.warning("agent-browser CLI not found: %s", e)
         return {"success": False, "error": str(e)}
     
     from tools.interrupt import is_interrupted
@@ -765,6 +780,7 @@ def _run_browser_command(
     try:
         session_info = _get_session_info(task_id)
     except Exception as e:
+        logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
     
     # Build the command with the appropriate backend flag.
@@ -790,16 +806,28 @@ def _run_browser_command(
         # Without this, parallel workers fight over the same default socket path,
         # causing "Failed to create socket directory: Permission denied" errors.
         task_socket_dir = os.path.join(
-            tempfile.gettempdir(), 
+            _socket_safe_tmpdir(),
             f"agent-browser-{session_info['session_name']}"
         )
-        os.makedirs(task_socket_dir, exist_ok=True)
+        os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+        logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
+                     command, task_id, task_socket_dir, len(task_socket_dir))
         
         browser_env = {**os.environ}
-        # Ensure PATH includes standard dirs (systemd services may have minimal PATH)
-        _SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        if "/usr/bin" not in browser_env.get("PATH", "").split(":"):
-            browser_env["PATH"] = f"{browser_env.get('PATH', '')}:{_SANE_PATH}"
+
+        # Ensure PATH includes Hermes-managed Node first, then standard system dirs.
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_node_bin = str(hermes_home / "node" / "bin")
+
+        existing_path = browser_env.get("PATH", "")
+        path_parts = [p for p in existing_path.split(":") if p]
+        candidate_dirs = [hermes_node_bin] + [p for p in _SANE_PATH.split(":") if p]
+
+        for part in reversed(candidate_dirs):
+            if os.path.isdir(part) and part not in path_parts:
+                path_parts.insert(0, part)
+
+        browser_env["PATH"] = ":".join(path_parts)
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
         
         result = subprocess.run(
@@ -822,10 +850,11 @@ def _run_browser_command(
                            command, " ".join(cmd_parts[:4]) + "...",
                            (result.stderr or "")[:200])
 
-        # Parse JSON output
-        if result.stdout.strip():
+        stdout_text = result.stdout.strip()
+
+        if stdout_text:
             try:
-                parsed = json.loads(result.stdout.strip())
+                parsed = json.loads(stdout_text)
                 # Warn if snapshot came back empty (common sign of daemon/CDP issues)
                 if command == "snapshot" and parsed.get("success"):
                     snap_data = parsed.get("data", {})
@@ -835,22 +864,49 @@ def _run_browser_command(
                                        "returncode=%s", result.returncode)
                 return parsed
             except json.JSONDecodeError:
-                # If not valid JSON, return as raw output
+                raw = stdout_text[:2000]
+                logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
+                               command, result.returncode, raw[:500])
+
+                if command == "screenshot":
+                    stderr_text = (result.stderr or "").strip()
+                    combined_text = "\n".join(
+                        part for part in [stdout_text, stderr_text] if part
+                    )
+                    recovered_path = _extract_screenshot_path_from_text(combined_text)
+
+                    if recovered_path and Path(recovered_path).exists():
+                        logger.info(
+                            "browser 'screenshot' recovered file from non-JSON output: %s",
+                            recovered_path,
+                        )
+                        return {
+                            "success": True,
+                            "data": {
+                                "path": recovered_path,
+                                "raw": raw,
+                            },
+                        }
+
                 return {
-                    "success": True,
-                    "data": {"raw": result.stdout.strip()}
+                    "success": False,
+                    "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
                 }
         
         # Check for errors
         if result.returncode != 0:
             error_msg = result.stderr.strip() if result.stderr else f"Command failed with code {result.returncode}"
+            logger.warning("browser '%s' failed (rc=%s): %s", command, result.returncode, error_msg[:300])
             return {"success": False, "error": error_msg}
         
         return {"success": True, "data": {}}
         
     except subprocess.TimeoutExpired:
+        logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
+                       command, timeout, task_id, task_socket_dir)
         return {"success": False, "error": f"Command timed out after {timeout} seconds"}
     except Exception as e:
+        logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         return {"success": False, "error": str(e)}
 
 
@@ -860,11 +916,8 @@ def _extract_relevant_content(
 ) -> str:
     """Use LLM to extract relevant content from a snapshot based on the user's task.
 
-    Falls back to simple truncation when no auxiliary vision model is configured.
+    Falls back to simple truncation when no auxiliary text model is configured.
     """
-    if _aux_vision_client is None or EXTRACTION_MODEL is None:
-        return _truncate_snapshot(snapshot_text)
-
     if user_task:
         extraction_prompt = (
             f"You are a content extractor for a browser automation agent.\n\n"
@@ -889,13 +942,16 @@ def _extract_relevant_content(
         )
 
     try:
-        from agent.auxiliary_client import auxiliary_max_tokens_param
-        response = _aux_vision_client.chat.completions.create(
-            model=EXTRACTION_MODEL,
-            messages=[{"role": "user", "content": extraction_prompt}],
-            **auxiliary_max_tokens_param(4000),
-            temperature=0.1,
-        )
+        call_kwargs = {
+            "task": "web_extract",
+            "messages": [{"role": "user", "content": extraction_prompt}],
+            "max_tokens": 4000,
+            "temperature": 0.1,
+        }
+        model = _get_extraction_model()
+        if model:
+            call_kwargs["model"] = model
+        response = call_llm(**call_kwargs)
         return response.choices[0].message.content
     except Exception:
         return _truncate_snapshot(snapshot_text)
@@ -940,9 +996,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     session_info = _get_session_info(effective_task_id)
     is_first_nav = session_info.get("_first_nav", True)
     
-    # Mark that we've done at least one navigation
+    # Auto-start recording if configured and this is first navigation
     if is_first_nav:
         session_info["_first_nav"] = False
+        _maybe_start_recording(effective_task_id)
     
     result = _run_browser_command(effective_task_id, "open", [url], timeout=60)
     
@@ -1198,42 +1255,123 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
 def browser_close(task_id: Optional[str] = None) -> str:
     """
     Close the browser session.
-    
+
     Args:
         task_id: Task identifier for session isolation
-        
+
     Returns:
         JSON string with close result
     """
     effective_task_id = task_id or "default"
-    result = _run_browser_command(effective_task_id, "close", [])
+    with _cleanup_lock:
+        had_session = effective_task_id in _active_sessions
+
+    cleanup_browser(effective_task_id)
+
+    response = {
+        "success": True,
+        "closed": True,
+    }
+    if not had_session:
+        response["warning"] = "Session may not have been active"
+    return json.dumps(response, ensure_ascii=False)
+
+
+def browser_console(clear: bool = False, task_id: Optional[str] = None) -> str:
+    """Get browser console messages and JavaScript errors.
     
-    # Close the backend session (Browserbase API in cloud mode, nothing extra in local mode)
-    session_key = task_id if task_id and task_id in _active_sessions else "default"
-    if session_key in _active_sessions:
-        session_info = _active_sessions[session_key]
-        bb_session_id = session_info.get("bb_session_id")
-        if bb_session_id:
-            # Cloud mode: release the Browserbase session via API
-            try:
-                config = _get_browserbase_config()
-                _close_browserbase_session(bb_session_id, config["api_key"], config["project_id"])
-            except Exception as e:
-                logger.warning("Could not close BrowserBase session: %s", e)
-        del _active_sessions[session_key]
+    Returns both console output (log/warn/error/info from the page's JS)
+    and uncaught exceptions (crashes, unhandled promise rejections).
     
-    if result.get("success"):
-        return json.dumps({
-            "success": True,
-            "closed": True
-        }, ensure_ascii=False)
-    else:
-        # Even if close fails, session was released
-        return json.dumps({
-            "success": True,
-            "closed": True,
-            "warning": result.get("error", "Session may not have been active")
-        }, ensure_ascii=False)
+    Args:
+        clear: If True, clear the message/error buffers after reading
+        task_id: Task identifier for session isolation
+        
+    Returns:
+        JSON string with console messages and JS errors
+    """
+    effective_task_id = task_id or "default"
+    
+    console_args = ["--clear"] if clear else []
+    error_args = ["--clear"] if clear else []
+    
+    console_result = _run_browser_command(effective_task_id, "console", console_args)
+    errors_result = _run_browser_command(effective_task_id, "errors", error_args)
+    
+    messages = []
+    if console_result.get("success"):
+        for msg in console_result.get("data", {}).get("messages", []):
+            messages.append({
+                "type": msg.get("type", "log"),
+                "text": msg.get("text", ""),
+                "source": "console",
+            })
+    
+    errors = []
+    if errors_result.get("success"):
+        for err in errors_result.get("data", {}).get("errors", []):
+            errors.append({
+                "message": err.get("message", ""),
+                "source": "exception",
+            })
+    
+    return json.dumps({
+        "success": True,
+        "console_messages": messages,
+        "js_errors": errors,
+        "total_messages": len(messages),
+        "total_errors": len(errors),
+    }, ensure_ascii=False)
+
+
+def _maybe_start_recording(task_id: str):
+    """Start recording if browser.record_sessions is enabled in config."""
+    if task_id in _recording_sessions:
+        return
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        config_path = hermes_home / "config.yaml"
+        record_enabled = False
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            record_enabled = cfg.get("browser", {}).get("record_sessions", False)
+        
+        if not record_enabled:
+            return
+        
+        recordings_dir = hermes_home / "browser_recordings"
+        recordings_dir.mkdir(parents=True, exist_ok=True)
+        _cleanup_old_recordings(max_age_hours=72)
+        
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        recording_path = recordings_dir / f"session_{timestamp}_{task_id[:16]}.webm"
+        
+        result = _run_browser_command(task_id, "record", ["start", str(recording_path)])
+        if result.get("success"):
+            _recording_sessions.add(task_id)
+            logger.info("Auto-recording browser session %s to %s", task_id, recording_path)
+        else:
+            logger.debug("Could not start auto-recording: %s", result.get("error"))
+    except Exception as e:
+        logger.debug("Auto-recording setup failed: %s", e)
+
+
+def _maybe_stop_recording(task_id: str):
+    """Stop recording if one is active for this session."""
+    if task_id not in _recording_sessions:
+        return
+    try:
+        result = _run_browser_command(task_id, "record", ["stop"])
+        if result.get("success"):
+            path = result.get("data", {}).get("path", "")
+            logger.info("Saved browser recording for session %s: %s", task_id, path)
+    except Exception as e:
+        logger.debug("Could not stop recording for %s: %s", task_id, e)
+    finally:
+        _recording_sessions.discard(task_id)
 
 
 def browser_get_images(task_id: Optional[str] = None) -> str:
@@ -1290,7 +1428,7 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
 
-def browser_vision(question: str, task_id: Optional[str] = None) -> str:
+def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> str:
     """
     Take a screenshot of the current page and analyze it with vision AI.
     
@@ -1304,6 +1442,7 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
     
     Args:
         question: What you want to know about the page visually
+        annotate: If True, overlay numbered [N] labels on interactive elements
         task_id: Task identifier for session isolation
         
     Returns:
@@ -1314,14 +1453,6 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
     from pathlib import Path
     
     effective_task_id = task_id or "default"
-    
-    # Check auxiliary vision client
-    if _aux_vision_client is None or EXTRACTION_MODEL is None:
-        return json.dumps({
-            "success": False,
-            "error": "Browser vision unavailable: no auxiliary vision model configured. "
-                     "Set OPENROUTER_API_KEY or configure Nous Portal to enable browser vision."
-        }, ensure_ascii=False)
     
     # Save screenshot to persistent location so it can be shared with users
     hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
@@ -1335,24 +1466,41 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
         _cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
         
         # Take screenshot using agent-browser
+        screenshot_args = []
+        if annotate:
+            screenshot_args.append("--annotate")
+        screenshot_args.append("--full")
+        screenshot_args.append(str(screenshot_path))
         result = _run_browser_command(
             effective_task_id, 
             "screenshot", 
-            [str(screenshot_path)],
+            screenshot_args,
             timeout=30
         )
         
         if not result.get("success"):
+            error_detail = result.get("error", "Unknown error")
+            mode = "local" if _is_local_mode() else "cloud"
             return json.dumps({
                 "success": False,
-                "error": f"Failed to take screenshot: {result.get('error', 'Unknown error')}"
+                "error": f"Failed to take screenshot ({mode} mode): {error_detail}"
             }, ensure_ascii=False)
-        
+
+        actual_screenshot_path = result.get("data", {}).get("path")
+        if actual_screenshot_path:
+            screenshot_path = Path(actual_screenshot_path)
+
         # Check if screenshot file was created
         if not screenshot_path.exists():
+            mode = "local" if _is_local_mode() else "cloud"
             return json.dumps({
                 "success": False,
-                "error": "Screenshot file was not created"
+                "error": (
+                    f"Screenshot file was not created at {screenshot_path} ({mode} mode). "
+                    f"This may indicate a socket path issue (macOS /var/folders/), "
+                    f"a missing Chromium install ('agent-browser install'), "
+                    f"or a stale daemon process."
+                ),
             }, ensure_ascii=False)
         
         # Read and convert to base64
@@ -1369,11 +1517,13 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
             f"Focus on answering the user's specific question."
         )
 
-        # Use the sync auxiliary vision client directly
-        from agent.auxiliary_client import auxiliary_max_tokens_param
-        response = _aux_vision_client.chat.completions.create(
-            model=EXTRACTION_MODEL,
-            messages=[
+        # Use the centralized LLM router
+        vision_model = _get_vision_model()
+        logger.debug("browser_vision: analysing screenshot (%d bytes)",
+                     len(image_data))
+        call_kwargs = {
+            "task": "vision",
+            "messages": [
                 {
                     "role": "user",
                     "content": [
@@ -1382,43 +1532,78 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
                     ],
                 }
             ],
-            **auxiliary_max_tokens_param(2000),
-            temperature=0.1,
-        )
+            "max_tokens": 2000,
+            "temperature": 0.1,
+        }
+        if vision_model:
+            call_kwargs["model"] = vision_model
+        response = call_llm(**call_kwargs)
         
         analysis = response.choices[0].message.content
-        return json.dumps({
+        response_data = {
             "success": True,
             "analysis": analysis,
             "screenshot_path": str(screenshot_path),
-        }, ensure_ascii=False)
+        }
+        # Include annotation data if annotated screenshot was taken
+        if annotate and result.get("data", {}).get("annotations"):
+            response_data["annotations"] = result["data"]["annotations"]
+        return json.dumps(response_data, ensure_ascii=False)
     
     except Exception as e:
-        # Clean up screenshot on failure
+        # Keep the screenshot if it was captured successfully — the failure is
+        # in the LLM vision analysis, not the capture.  Deleting a valid
+        # screenshot loses evidence the user might need.  The 24-hour cleanup
+        # in _cleanup_old_screenshots prevents unbounded disk growth.
+        logger.warning("browser_vision failed: %s", e, exc_info=True)
+        error_info = {"success": False, "error": f"Error during vision analysis: {str(e)}"}
         if screenshot_path.exists():
-            try:
-                screenshot_path.unlink()
-            except Exception:
-                pass
-        return json.dumps({
-            "success": False,
-            "error": f"Error during vision analysis: {str(e)}"
-        }, ensure_ascii=False)
+            error_info["screenshot_path"] = str(screenshot_path)
+            error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
+        return json.dumps(error_info, ensure_ascii=False)
 
 
 def _cleanup_old_screenshots(screenshots_dir, max_age_hours=24):
-    """Remove browser screenshots older than max_age_hours to prevent disk bloat."""
-    import time
+    """Remove browser screenshots older than max_age_hours to prevent disk bloat.
+
+    Throttled to run at most once per hour per directory to avoid repeated
+    scans on screenshot-heavy workflows.
+    """
+    key = str(screenshots_dir)
+    now = time.time()
+    if now - _last_screenshot_cleanup_by_dir.get(key, 0.0) < 3600:
+        return
+    _last_screenshot_cleanup_by_dir[key] = now
+
     try:
         cutoff = time.time() - (max_age_hours * 3600)
         for f in screenshots_dir.glob("browser_screenshot_*.png"):
             try:
                 if f.stat().st_mtime < cutoff:
                     f.unlink()
-            except Exception:
-                pass
-    except Exception:
-        pass  # Non-critical — don't fail the screenshot operation
+            except Exception as e:
+                logger.debug("Failed to clean old screenshot %s: %s", f, e)
+    except Exception as e:
+        logger.debug("Screenshot cleanup error (non-critical): %s", e)
+
+
+def _cleanup_old_recordings(max_age_hours=72):
+    """Remove browser recordings older than max_age_hours to prevent disk bloat."""
+    import time
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        recordings_dir = hermes_home / "browser_recordings"
+        if not recordings_dir.exists():
+            return
+        cutoff = time.time() - (max_age_hours * 3600)
+        for f in recordings_dir.glob("session_*.webm"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except Exception as e:
+                logger.debug("Failed to clean old recording %s: %s", f, e)
+    except Exception as e:
+        logger.debug("Recording cleanup error (non-critical): %s", e)
 
 
 # ============================================================================
@@ -1492,6 +1677,9 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
         
+        # Stop auto-recording before closing (saves the file)
+        _maybe_stop_recording(task_id)
+        
         # Try to close via agent-browser first (needs session in _active_sessions)
         try:
             _run_browser_command(task_id, "close", [], timeout=10)
@@ -1517,17 +1705,17 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         # Kill the daemon process and clean up socket directory
         session_name = session_info.get("session_name", "")
         if session_name:
-            socket_dir = os.path.join(tempfile.gettempdir(), f"agent-browser-{session_name}")
+            socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
             if os.path.exists(socket_dir):
                 # agent-browser writes {session}.pid in the socket dir
                 pid_file = os.path.join(socket_dir, f"{session_name}.pid")
                 if os.path.isfile(pid_file):
                     try:
-                        daemon_pid = int(open(pid_file).read().strip())
+                        daemon_pid = int(Path(pid_file).read_text().strip())
                         os.kill(daemon_pid, signal.SIGTERM)
                         logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
                     except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        pass
+                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
                 shutil.rmtree(socket_dir, ignore_errors=True)
         
         logger.debug("Removed task %s from active sessions", task_id)
@@ -1707,6 +1895,13 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+)
+registry.register(
+    name="browser_console",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_console"],
+    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
 )

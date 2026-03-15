@@ -63,19 +63,54 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 |----------|-------|
 | **Nous Portal** | `hermes model` (OAuth, subscription-based) |
 | **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
+| **Anthropic** | `hermes model` (Claude Pro/Max via Claude Code auth, Anthropic API key, or manual setup-token) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
 | **MiniMax** | `MINIMAX_API_KEY` in `~/.hermes/.env` (provider: `minimax`) |
 | **MiniMax China** | `MINIMAX_CN_API_KEY` in `~/.hermes/.env` (provider: `minimax-cn`) |
-| **Custom Endpoint** | `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
+| **Custom Endpoint** | `hermes model` (saved in `config.yaml`) or `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
 
 :::info Codex Note
-The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Credentials are stored at `~/.codex/auth.json` and auto-refresh. No Codex CLI installation required.
+The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Hermes stores the resulting credentials in its own auth store under `~/.hermes/auth.json` and can import existing Codex CLI credentials from `~/.codex/auth.json` when present. No Codex CLI installation is required.
 :::
 
 :::warning
-Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use OpenRouter independently. An `OPENROUTER_API_KEY` enables these tools.
+Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use a separate "auxiliary" model — by default Gemini Flash via OpenRouter. An `OPENROUTER_API_KEY` enables these tools automatically. You can also configure which model and provider these tools use — see [Auxiliary Models](#auxiliary-models) below.
+:::
+
+### Anthropic (Native)
+
+Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
+
+```bash
+# With an API key (pay-per-token)
+export ANTHROPIC_API_KEY=***
+hermes chat --provider anthropic --model claude-sonnet-4-6
+
+# Preferred: authenticate through `hermes model`
+# Hermes will use Claude Code's credential store directly when available
+hermes model
+
+# Manual override with a setup-token (fallback / legacy)
+export ANTHROPIC_TOKEN=***  # setup-token or manual OAuth token
+hermes chat --provider anthropic
+
+# Auto-detect Claude Code credentials (if you already use Claude Code)
+hermes chat --provider anthropic  # reads Claude Code credential files automatically
+```
+
+When you choose Anthropic OAuth through `hermes model`, Hermes prefers Claude Code's own credential store over copying the token into `~/.hermes/.env`. That keeps refreshable Claude credentials refreshable.
+
+Or set it permanently:
+```yaml
+model:
+  provider: "anthropic"
+  default: "claude-sonnet-4-6"
+```
+
+:::tip Aliases
+`--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
 :::
 
 ### First-Class Chinese AI Providers
@@ -128,9 +163,11 @@ hermes model
 ```bash
 # Add to ~/.hermes/.env
 OPENAI_BASE_URL=http://localhost:8000/v1
-OPENAI_API_KEY=your-key-or-dummy
+OPENAI_API_KEY=***
 LLM_MODEL=your-model-name
 ```
+
+`hermes model` and the manual `.env` approach end up in the same runtime path. If you save a custom endpoint through `hermes model`, Hermes persists the provider + base URL in `config.yaml` so later sessions keep using that endpoint even if `OPENAI_BASE_URL` is not exported in your current shell.
 
 Everything below follows this same pattern — just change the URL, key, and model name.
 
@@ -384,6 +421,26 @@ provider_routing:
 
 **Shortcuts:** Append `:nitro` to any model name for throughput sorting (e.g., `anthropic/claude-sonnet-4:nitro`), or `:floor` for price sorting.
 
+## Fallback Model
+
+Configure a backup provider:model that Hermes switches to automatically when your primary model fails (rate limits, server errors, auth failures):
+
+```yaml
+fallback_model:
+  provider: openrouter                    # required
+  model: anthropic/claude-sonnet-4        # required
+  # base_url: http://localhost:8000/v1    # optional, for custom endpoints
+  # api_key_env: MY_CUSTOM_KEY           # optional, env var name for custom endpoint API key
+```
+
+When activated, the fallback swaps the model and provider mid-session without losing your conversation. It fires **at most once** per session.
+
+Supported providers: `openrouter`, `nous`, `openai-codex`, `anthropic`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `custom`.
+
+:::tip
+Fallback is configured exclusively through `config.yaml` — there are no environment variables for it. For full details on when it triggers, supported providers, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/docs/user-guide/features/fallback-providers).
+:::
+
 ## Terminal Backend Configuration
 
 Configure which environment the agent uses for terminal commands:
@@ -393,7 +450,72 @@ terminal:
   backend: local    # or: docker, ssh, singularity, modal, daytona
   cwd: "."          # Working directory ("." = current dir)
   timeout: 180      # Command timeout in seconds
+
+  # Docker-specific settings
+  docker_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+  docker_volumes:                    # Share host directories with the container
+    - "/home/user/projects:/workspace/projects"
+    - "/home/user/data:/data:ro"     # :ro for read-only
+
+  # Container resource limits (docker, singularity, modal, daytona)
+  container_cpu: 1                   # CPU cores
+  container_memory: 5120             # MB (default 5GB)
+  container_disk: 51200              # MB (default 50GB)
+  container_persistent: true         # Persist filesystem across sessions
 ```
+
+### Common Terminal Backend Issues
+
+If terminal commands fail immediately or the terminal tool is reported as disabled, check the following:
+
+- **Local backend**
+  - No special requirements. This is the safest default when you are just getting started.
+
+- **Docker backend**
+  - Ensure Docker Desktop (or the Docker daemon) is installed and running.
+  - Hermes needs to be able to find the `docker` CLI. It checks your `$PATH` first and also probes common Docker Desktop install locations on macOS. Run:
+    ```bash
+    docker version
+    ```
+    If this fails, fix your Docker installation or switch back to the local backend:
+    ```bash
+    hermes config set terminal.backend local
+    ```
+
+- **SSH backend**
+  - Both `TERMINAL_SSH_HOST` and `TERMINAL_SSH_USER` must be set, for example:
+    ```bash
+    export TERMINAL_ENV=ssh
+    export TERMINAL_SSH_HOST=my-server.example.com
+    export TERMINAL_SSH_USER=ubuntu
+    ```
+  - If either value is missing, Hermes will log a clear error and refuse to use the SSH backend.
+
+- **Modal backend**
+  - You need either a `MODAL_TOKEN_ID` environment variable or a `~/.modal.toml` config file.
+  - If neither is present, the backend check fails and Hermes will report that the Modal backend is not available.
+
+When in doubt, set `terminal.backend` back to `local` and verify that commands run there first.
+
+### Docker Volume Mounts
+
+When using the Docker backend, `docker_volumes` lets you share host directories with the container. Each entry uses standard Docker `-v` syntax: `host_path:container_path[:options]`.
+
+```yaml
+terminal:
+  backend: docker
+  docker_volumes:
+    - "/home/user/projects:/workspace/projects"   # Read-write (default)
+    - "/home/user/datasets:/data:ro"              # Read-only
+    - "/home/user/outputs:/outputs"               # Agent writes, you read
+```
+
+This is useful for:
+- **Providing files** to the agent (datasets, configs, reference code)
+- **Receiving files** from the agent (generated code, reports, exports)
+- **Shared workspaces** where both you and the agent access the same files
+
+Can also be set via environment variable: `TERMINAL_DOCKER_VOLUMES='["/host:/container"]'` (JSON array).
 
 See [Code Execution](features/code-execution.md) and the [Terminal section of the README](features/tools.md) for details on each backend.
 
@@ -432,8 +554,155 @@ node_modules/
 ```yaml
 compression:
   enabled: true
-  threshold: 0.85    # Compress at 85% of context limit
+  threshold: 0.50              # Compress at 50% of context limit by default
+  summary_model: "google/gemini-3-flash-preview"   # Model for summarization
+  # summary_provider: "auto"   # "auto", "openrouter", "nous", "main"
 ```
+
+The `summary_model` must support a context length at least as large as your main model's, since it receives the full middle section of the conversation for compression.
+
+## Iteration Budget Pressure
+
+When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 90 turns) without realizing it's running low. Budget pressure automatically warns the model as it approaches the limit:
+
+| Threshold | Level | What the model sees |
+|-----------|-------|---------------------|
+| **70%** | Caution | `[BUDGET: 63/90. 27 iterations left. Start consolidating.]` |
+| **90%** | Warning | `[BUDGET WARNING: 81/90. Only 9 left. Respond NOW.]` |
+
+Warnings are injected into the last tool result's JSON (as a `_budget_warning` field) rather than as separate messages — this preserves prompt caching and doesn't disrupt the conversation structure.
+
+```yaml
+agent:
+  max_turns: 90                # Max iterations per conversation turn (default: 90)
+```
+
+Budget pressure is enabled by default. The agent sees warnings naturally as part of tool results, encouraging it to consolidate its work and deliver a response before running out of iterations.
+
+## Auxiliary Models
+
+Hermes uses lightweight "auxiliary" models for side tasks like image analysis, web page summarization, and browser screenshot analysis. By default, these use **Gemini Flash** via OpenRouter or Nous Portal — you don't need to configure anything.
+
+To use a different model, add an `auxiliary` section to `~/.hermes/config.yaml`:
+
+```yaml
+auxiliary:
+  # Image analysis (vision_analyze tool + browser screenshots)
+  vision:
+    provider: "auto"           # "auto", "openrouter", "nous", "main"
+    model: ""                  # e.g. "openai/gpt-4o", "google/gemini-2.5-flash"
+    base_url: ""               # direct OpenAI-compatible endpoint (takes precedence over provider)
+    api_key: ""                # API key for base_url (falls back to OPENAI_API_KEY)
+
+  # Web page summarization + browser page text extraction
+  web_extract:
+    provider: "auto"
+    model: ""                  # e.g. "google/gemini-2.5-flash"
+    base_url: ""
+    api_key: ""
+```
+
+### Changing the Vision Model
+
+To use GPT-4o instead of Gemini Flash for image analysis:
+
+```yaml
+auxiliary:
+  vision:
+    model: "openai/gpt-4o"
+```
+
+Or via environment variable (in `~/.hermes/.env`):
+
+```bash
+AUXILIARY_VISION_MODEL=openai/gpt-4o
+```
+
+### Provider Options
+
+| Provider | Description | Requirements |
+|----------|-------------|-------------|
+| `"auto"` | Best available (default). Vision tries OpenRouter → Nous → Codex. | — |
+| `"openrouter"` | Force OpenRouter — routes to any model (Gemini, GPT-4o, Claude, etc.) | `OPENROUTER_API_KEY` |
+| `"nous"` | Force Nous Portal | `hermes login` |
+| `"codex"` | Force Codex OAuth (ChatGPT account). Supports vision (gpt-5.3-codex). | `hermes model` → Codex |
+| `"main"` | Use your active custom/main endpoint. This can come from `OPENAI_BASE_URL` + `OPENAI_API_KEY` or from a custom endpoint saved via `hermes model` / `config.yaml`. Works with OpenAI, local models, or any OpenAI-compatible API. | Custom endpoint credentials + base URL |
+
+### Common Setups
+
+**Using a direct custom endpoint** (clearer than `provider: "main"` for local/self-hosted APIs):
+```yaml
+auxiliary:
+  vision:
+    base_url: "http://localhost:1234/v1"
+    api_key: "local-key"
+    model: "qwen2.5-vl"
+```
+
+`base_url` takes precedence over `provider`, so this is the most explicit way to route an auxiliary task to a specific endpoint. For direct endpoint overrides, Hermes uses the configured `api_key` or falls back to `OPENAI_API_KEY`; it does not reuse `OPENROUTER_API_KEY` for that custom endpoint.
+
+**Using OpenAI API key for vision:**
+```yaml
+# In ~/.hermes/.env:
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_API_KEY=sk-...
+
+auxiliary:
+  vision:
+    provider: "main"
+    model: "gpt-4o"       # or "gpt-4o-mini" for cheaper
+```
+
+**Using OpenRouter for vision** (route to any model):
+```yaml
+auxiliary:
+  vision:
+    provider: "openrouter"
+    model: "openai/gpt-4o"      # or "google/gemini-2.5-flash", etc.
+```
+
+**Using Codex OAuth** (ChatGPT Pro/Plus account — no API key needed):
+```yaml
+auxiliary:
+  vision:
+    provider: "codex"     # uses your ChatGPT OAuth token
+    # model defaults to gpt-5.3-codex (supports vision)
+```
+
+**Using a local/self-hosted model:**
+```yaml
+auxiliary:
+  vision:
+    provider: "main"      # uses your active custom endpoint
+    model: "my-local-model"
+```
+
+`provider: "main"` follows the same custom endpoint Hermes uses for normal chat. That endpoint can be set directly with `OPENAI_BASE_URL`, or saved once through `hermes model` and persisted in `config.yaml`.
+
+:::tip
+If you use Codex OAuth as your main model provider, vision works automatically — no extra configuration needed. Codex is included in the auto-detection chain for vision.
+:::
+
+:::warning
+**Vision requires a multimodal model.** If you set `provider: "main"`, make sure your endpoint supports multimodal/vision — otherwise image analysis will fail.
+:::
+
+### Environment Variables
+
+You can also configure auxiliary models via environment variables instead of `config.yaml`:
+
+| Setting | Environment Variable |
+|---------|---------------------|
+| Vision provider | `AUXILIARY_VISION_PROVIDER` |
+| Vision model | `AUXILIARY_VISION_MODEL` |
+| Web extract provider | `AUXILIARY_WEB_EXTRACT_PROVIDER` |
+| Web extract model | `AUXILIARY_WEB_EXTRACT_MODEL` |
+| Compression provider | `CONTEXT_COMPRESSION_PROVIDER` |
+| Compression model | `CONTEXT_COMPRESSION_MODEL` |
+
+:::tip
+Run `hermes config` to see your current auxiliary model settings. Overrides only show up when they differ from the defaults.
+:::
 
 ## Reasoning Effort
 
@@ -445,6 +714,16 @@ agent:
 ```
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
+
+You can also change the reasoning effort at runtime with the `/reasoning` command:
+
+```
+/reasoning           # Show current effort level and display state
+/reasoning high      # Set reasoning effort to high
+/reasoning none      # Disable reasoning
+/reasoning show      # Show model thinking above each response
+/reasoning hide      # Hide model thinking
+```
 
 ## TTS Configuration
 
@@ -461,13 +740,20 @@ tts:
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
 ```
 
+This controls both the `text_to_speech` tool and spoken replies in voice mode (`/voice tts` in the CLI or messaging gateway).
+
 ## Display Settings
 
 ```yaml
 display:
-  tool_progress: all    # off | new | all | verbose
-  personality: "kawaii"  # Default personality for the CLI
-  compact: false         # Compact output mode (less whitespace)
+  tool_progress: all      # off | new | all | verbose
+  skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
+  personality: "kawaii"  # Legacy cosmetic field still surfaced in some summaries
+  compact: false          # Compact output mode (less whitespace)
+  resume_display: full    # full (show previous messages on resume) | minimal (one-liner only)
+  bell_on_complete: false # Play terminal bell when agent finishes (great for long tasks)
+  show_reasoning: false   # Show model reasoning/thinking above each response (toggle with /reasoning show|hide)
+  background_process_notifications: all  # all | result | error | off (gateway only)
 ```
 
 | Mode | What you see |
@@ -481,10 +767,71 @@ display:
 
 ```yaml
 stt:
-  provider: "openai"           # STT provider
+  provider: "local"            # "local" | "groq" | "openai"
+  local:
+    model: "base"              # tiny, base, small, medium, large-v3
+  openai:
+    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
+  # model: "whisper-1"         # Legacy fallback key still respected
 ```
 
-Requires `VOICE_TOOLS_OPENAI_KEY` in `.env` for OpenAI STT.
+Provider behavior:
+
+- `local` uses `faster-whisper` running on your machine. Install it separately with `pip install faster-whisper`.
+- `groq` uses Groq's Whisper-compatible endpoint and reads `GROQ_API_KEY`.
+- `openai` uses the OpenAI speech API and reads `VOICE_TOOLS_OPENAI_KEY`.
+
+If the requested provider is unavailable, Hermes falls back automatically in this order: `local` → `groq` → `openai`.
+
+Groq and OpenAI model overrides are environment-driven:
+
+```bash
+STT_GROQ_MODEL=whisper-large-v3-turbo
+STT_OPENAI_MODEL=whisper-1
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+STT_OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+## Voice Mode (CLI)
+
+```yaml
+voice:
+  record_key: "ctrl+b"         # Push-to-talk key inside the CLI
+  max_recording_seconds: 120    # Hard stop for long recordings
+  auto_tts: false               # Enable spoken replies automatically when /voice on
+  silence_threshold: 200        # RMS threshold for speech detection
+  silence_duration: 3.0         # Seconds of silence before auto-stop
+```
+
+Use `/voice on` in the CLI to enable microphone mode, `record_key` to start/stop recording, and `/voice tts` to toggle spoken replies. See [Voice Mode](/docs/user-guide/features/voice-mode) for end-to-end setup and platform-specific behavior.
+
+## Quick Commands
+
+Define custom commands that run shell commands without invoking the LLM — zero token usage, instant execution. Especially useful from messaging platforms (Telegram, Discord, etc.) for quick server checks or utility scripts.
+
+```yaml
+quick_commands:
+  status:
+    type: exec
+    command: systemctl status hermes-agent
+  disk:
+    type: exec
+    command: df -h /
+  update:
+    type: exec
+    command: cd ~/.hermes/hermes-agent && git pull && pip install -e .
+  gpu:
+    type: exec
+    command: nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader
+```
+
+Usage: type `/status`, `/disk`, `/update`, or `/gpu` in the CLI or any messaging platform. The command runs locally on the host and returns the output directly — no LLM call, no tokens consumed.
+
+- **30-second timeout** — long-running commands are killed with an error message
+- **Priority** — quick commands are checked before skill commands, so you can override skill names
+- **Autocomplete** — quick commands are resolved at dispatch time and are not shown in the built-in slash-command autocomplete tables
+- **Type** — only `exec` is supported (runs a shell command); other types show an error
+- **Works everywhere** — CLI, Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant
 
 ## Human Delay
 
@@ -507,6 +854,27 @@ code_execution:
   max_tool_calls: 50           # Max tool calls within code execution
 ```
 
+## Browser
+
+Configure browser automation behavior:
+
+```yaml
+browser:
+  inactivity_timeout: 120        # Seconds before auto-closing idle sessions
+  record_sessions: false         # Auto-record browser sessions as WebM videos to ~/.hermes/browser_recordings/
+```
+
+## Checkpoints
+
+Automatic filesystem snapshots before destructive file operations. See the [Checkpoints feature page](/docs/user-guide/features/checkpoints) for details.
+
+```yaml
+checkpoints:
+  enabled: false                 # Enable automatic checkpoints (also: hermes --checkpoints)
+  max_snapshots: 50              # Max checkpoints to keep per directory
+```
+
+
 ## Delegation
 
 Configure subagent behavior for the delegate tool:
@@ -518,7 +886,19 @@ delegation:
     - terminal
     - file
     - web
+  # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
+  # provider: "openrouter"                  # Override provider (empty = inherit parent)
+  # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
+  # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
 ```
+
+**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+
+**Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
+
+The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
+
+**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
 ## Clarify
 
@@ -531,18 +911,24 @@ clarify:
 
 ## Context Files (SOUL.md, AGENTS.md)
 
-Drop these files in your project directory and the agent automatically picks them up:
+Hermes uses two different context scopes:
 
-| File | Purpose |
-|------|---------|
-| `AGENTS.md` | Project-specific instructions, coding conventions |
-| `SOUL.md` | Persona definition — the agent embodies this personality |
-| `.cursorrules` | Cursor IDE rules (also detected) |
-| `.cursor/rules/*.mdc` | Cursor rule files (also detected) |
+| File | Purpose | Scope |
+|------|---------|-------|
+| `AGENTS.md` | Project-specific instructions, coding conventions | Working directory / project tree |
+| `SOUL.md` | Default persona for this Hermes instance | `~/.hermes/SOUL.md` or `$HERMES_HOME/SOUL.md` |
+| `.cursorrules` | Cursor IDE rules (also detected) | Working directory |
+| `.cursor/rules/*.mdc` | Cursor rule files (also detected) | Working directory |
 
 - **AGENTS.md** is hierarchical: if subdirectories also have AGENTS.md, all are combined.
-- **SOUL.md** checks cwd first, then `~/.hermes/SOUL.md` as a global fallback.
-- All context files are capped at 20,000 characters with smart truncation.
+- **SOUL.md** is now global to the Hermes instance and is loaded only from `HERMES_HOME`.
+- Hermes automatically seeds a default `SOUL.md` if one does not already exist.
+- An empty `SOUL.md` contributes nothing to the system prompt.
+- All loaded context files are capped at 20,000 characters with smart truncation.
+
+See also:
+- [Personality & SOUL.md](/docs/user-guide/features/personality)
+- [Context Files](/docs/user-guide/features/context-files)
 
 ## Working Directory
 

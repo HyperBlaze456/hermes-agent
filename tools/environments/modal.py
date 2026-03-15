@@ -13,12 +13,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from hermes_cli.config import get_hermes_home
 from tools.environments.base import BaseEnvironment
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
-_SNAPSHOT_STORE = Path.home() / ".hermes" / "modal_snapshots.json"
+_SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 
 
 def _load_snapshots() -> Dict[str, str]:
@@ -50,7 +51,7 @@ class ModalEnvironment(BaseEnvironment):
     def __init__(
         self,
         image: str,
-        cwd: str = "~",
+        cwd: str = "/root",
         timeout: int = 60,
         modal_sandbox_kwargs: Optional[Dict[str, Any]] = None,
         persistent_filesystem: bool = True,
@@ -95,6 +96,7 @@ class ModalEnvironment(BaseEnvironment):
             startup_timeout=180.0,
             runtime_timeout=3600.0,
             modal_sandbox_kwargs=sandbox_kwargs,
+            install_pipx=True,  # Required: installs pipx + swe-rex runtime (swerex-remote)
         )
 
     def execute(self, command: str, cwd: str = "", *,
@@ -106,7 +108,20 @@ class ModalEnvironment(BaseEnvironment):
                 marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
             command = f"{command} << '{marker}'\n{stdin_data}\n{marker}"
 
-        exec_command = self._prepare_command(command)
+        exec_command, sudo_stdin = self._prepare_command(command)
+
+        # Modal sandboxes execute commands via the Modal SDK and cannot pipe
+        # subprocess stdin directly the way a local Popen can.  When a sudo
+        # password is present, use a shell-level pipe from printf so that the
+        # password feeds sudo -S without appearing as an echo argument embedded
+        # in the shell string.  The password is still visible in the remote
+        # sandbox's command line, but it is not exposed on the user's local
+        # machine — which is the primary threat being mitigated.
+        if sudo_stdin is not None:
+            import shlex
+            exec_command = (
+                f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
+            )
 
         # Run in a background thread so we can poll for interrupts
         result_holder = {"value": None, "error": None}
@@ -137,6 +152,10 @@ class ModalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Snapshot the filesystem (if persistent) then stop the sandbox."""
+        # Check if _inner was ever set (init may have failed)
+        if not hasattr(self, '_inner') or self._inner is None:
+            return
+
         if self._persistent:
             try:
                 sandbox = getattr(self._inner, 'deployment', None)
